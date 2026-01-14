@@ -9,13 +9,13 @@
 #pragma comment(lib, "fwpkclnt.lib")
 #pragma comment(lib, "ndis.lib")
 
-// --- [전방 선언: FN1 시그니처 반영] ---
+//전방 선언
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath);
 void DriverUnload(PDRIVER_OBJECT DriverObject);
 NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 NTSTATUS RegisterWfpFilter(PDEVICE_OBJECT pDeviceObj);
 
-// 헤더에서 확인하신 FN1 규격 (인자 7개)
+
 void NTAPI FilterClassify(
     const FWPS_INCOMING_VALUES0* inFixedValues,
     const FWPS_INCOMING_METADATA_VALUES0* inMetaValues,
@@ -60,7 +60,7 @@ void NTAPI FilterClassify(
 )
 {
 
-    // 인자 정렬이 맞으므로 이제 classifyOut 주소가 올바르게 잡힙니다.
+    
     if (classifyOut == NULL || !MmIsAddressValid(classifyOut)) {
         return;
     }
@@ -78,6 +78,7 @@ void NTAPI FilterClassify(
     if (targetPid == 0) return;
 
     // BSOD 방지 : PID 필드 존재 여부 확인 후 차단 로직 실행
+    // PID가 없는 패킷도 존재할 수 있음
     if ((inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID) != 0)
     {
         if (inMetaValues->processId == (UINT64)targetPid)
@@ -110,7 +111,7 @@ NTSTATUS NTAPI FilterNotify(
 }
 #pragma code_seg()
 
-// --- [등록 및 I/O 로직] ---
+// 등록 및 I/O 로직-
 
 NTSTATUS RegisterWfpFilter(PDEVICE_OBJECT pDeviceObj) {
     NTSTATUS status = STATUS_SUCCESS;
