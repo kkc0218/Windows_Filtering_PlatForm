@@ -112,6 +112,9 @@ NTSTATUS NTAPI FilterNotifyDns(
     _Inout_ FWPS_FILTER1* filter
 );
 
+// SNI 차단 관련 전방 선언 (버그 수정: IsIpBlockedWithSniIncrement에서 사용)
+BOOLEAN IsSniBlocked(_In_ const CHAR* sni);
+
 // ============================================================================
 // 메모리 섹션 설정
 // ============================================================================
@@ -210,6 +213,17 @@ typedef struct _DRIVER_CONTEXT {
     PBLOCKED_IP_CACHE IpCache;
 
     volatile LONG BatchSequence;
+
+    // ============================================================================
+    // DNS 싱크홀 컨텍스트 (v3.0 신규)
+    // ============================================================================
+    volatile ULONG DnsSinkholeEnabled;      // DNS 싱크홀 활성화 상태
+    volatile ULONG SinkholeIp;              // 싱크홀 IP (호스트 바이트 오더)
+    volatile USHORT SinkholeHttpPort;       // HTTP 포트
+    volatile USHORT SinkholeHttpsPort;      // HTTPS 포트
+    volatile LONG64 TotalDnsModified;       // 수정된 DNS 응답 수
+    volatile LONG64 TotalSinkholeRedirected;// 싱크홀로 리다이렉션된 연결 수
+    KSPIN_LOCK DnsSinkholeLock;             // 싱크홀 설정 보호용 스핀락
 } DRIVER_CONTEXT, * PDRIVER_CONTEXT;
 
 // ============================================================================
@@ -230,6 +244,17 @@ void ToLowerCase(_Inout_ CHAR* str, _In_ SIZE_T maxLen)
             str[i] = str[i] + ('a' - 'A');
         }
     }
+}
+
+// 루프백 주소 확인 (127.0.0.0/8) - 싱크홀 서버 연결 허용용
+// WFP의 IP 주소는 호스트 바이트 오더 (Windows = 리틀엔디안)
+// 127.x.x.x 체크
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN IsLoopbackAddress(_In_ UINT32 hostOrderIp)
+{
+    // 호스트 바이트 오더에서 첫 번째 옥텟 추출
+    UCHAR firstByte = (UCHAR)((hostOrderIp >> 24) & 0xFF);
+    return (firstByte == 127);
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -332,6 +357,11 @@ BOOLEAN AddBlockedIp(_In_ ULONG ipAddress, _In_ const CHAR* sni)
     LARGE_INTEGER oldestTime = { 0 };
 
     if (g_DriverContext == NULL || g_DriverContext->IpCache == NULL || ipAddress == 0) {
+        return FALSE;
+    }
+
+    // 루프백 주소(127.0.0.0/8)는 캐시에 추가하지 않음 (싱크홀 서버 보호)
+    if (IsLoopbackAddress(ipAddress)) {
         return FALSE;
     }
 
@@ -447,6 +477,65 @@ BOOLEAN IsIpBlocked(_In_ ULONG ipAddress)
     }
 
     KeReleaseInStackQueuedSpinLock(&lockHandle);
+    return blocked;
+}
+
+// IP가 차단 목록에 있는지 확인하고 연관된 SNI의 차단 횟수도 증가시킴 (버그 수정)
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN IsIpBlockedWithSniIncrement(_In_ ULONG ipAddress)
+{
+    KLOCK_QUEUE_HANDLE lockHandle;
+    PBLOCKED_IP_CACHE cache;
+    BOOLEAN blocked = FALSE;
+    LARGE_INTEGER currentTime;
+    LARGE_INTEGER timeout;
+    CHAR associatedSni[MAX_SNI_LENGTH];
+
+    associatedSni[0] = '\0';
+
+    if (g_DriverContext == NULL || g_DriverContext->IpCache == NULL ||
+        g_DriverContext->SniBlockingEnabled == 0 || ipAddress == 0) {
+        return FALSE;
+    }
+
+    cache = g_DriverContext->IpCache;
+    KeQuerySystemTime(&currentTime);
+
+    // 타임아웃 계산 (30분)
+    timeout.QuadPart = (LONGLONG)IP_CACHE_TIMEOUT_SEC * 10000000LL;
+
+    KeAcquireInStackQueuedSpinLock(&cache->Lock, &lockHandle);
+
+    for (LONG i = 0; i < MAX_BLOCKED_IPS; i++) {
+        if (cache->Entries[i].InUse) {
+            // 만료 확인
+            if ((currentTime.QuadPart - cache->Entries[i].AddedTime.QuadPart) > timeout.QuadPart) {
+                cache->Entries[i].InUse = FALSE;
+                cache->Entries[i].IpAddress = 0;
+                InterlockedDecrement(&cache->Count);
+                continue;
+            }
+
+            if (cache->Entries[i].IpAddress == ipAddress) {
+                blocked = TRUE;
+                InterlockedIncrement(&cache->Entries[i].HitCount);
+                cache->Entries[i].AddedTime = currentTime;
+                // 연관된 SNI 복사
+                if (cache->Entries[i].AssociatedSni[0] != '\0') {
+                    RtlStringCchCopyA(associatedSni, MAX_SNI_LENGTH, cache->Entries[i].AssociatedSni);
+                }
+                break;
+            }
+        }
+    }
+
+    KeReleaseInStackQueuedSpinLock(&lockHandle);
+
+    // IP 캐시 기반 차단 시 연관된 SNI의 차단 횟수도 증가시킴 (버그 수정)
+    if (blocked && associatedSni[0] != '\0') {
+        IsSniBlocked(associatedSni);
+    }
+
     return blocked;
 }
 
@@ -1177,9 +1266,9 @@ void ParseDnsResponseForBlocking(
 
     for (USHORT i = 0; i < anCount && offset + 12 <= dataLen; i++) {
         domainName[0] = '\0';
-       // SIZE_T nameStart = offset;
+        // SIZE_T nameStart = offset;
 
-        // 도메인 이름 추출
+         // 도메인 이름 추출
         SIZE_T nameOffset = offset;
         SIZE_T nameLen = 0;
 
@@ -1257,6 +1346,263 @@ void ParseDnsResponseForBlocking(
 
         offset += rdLength;
     }
+}
+
+// ============================================================================
+// DNS 싱크홀 함수 (v3.0 신규)
+// ============================================================================
+
+// DNS 싱크홀 초기화
+_IRQL_requires_max_(PASSIVE_LEVEL)
+NTSTATUS InitializeDnsSinkhole(void)
+{
+    if (g_DriverContext == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    // 기본값 설정
+    g_DriverContext->DnsSinkholeEnabled = 0;  // 기본 비활성화
+    g_DriverContext->SinkholeIp = DNS_SINKHOLE_DEFAULT_IP;  // 127.0.0.1
+    g_DriverContext->SinkholeHttpPort = DNS_SINKHOLE_HTTP_PORT;
+    g_DriverContext->SinkholeHttpsPort = DNS_SINKHOLE_HTTPS_PORT;
+    g_DriverContext->TotalDnsModified = 0;
+    g_DriverContext->TotalSinkholeRedirected = 0;
+    KeInitializeSpinLock(&g_DriverContext->DnsSinkholeLock);
+
+    KdPrint(("WFP DNS Sinkhole: Initialized (default IP: 127.0.0.1)\n"));
+    return STATUS_SUCCESS;
+}
+
+// DNS 이름 추출 (압축 포인터 지원)
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Success_(return > 0)
+SIZE_T ExtractDnsName(
+    _In_reads_bytes_(dataLen) const UCHAR * data,
+    _In_ SIZE_T dataLen,
+    _In_ SIZE_T offset,
+    _Out_writes_z_(nameBufferLen) CHAR * nameBuffer,
+    _In_ SIZE_T nameBufferLen
+)
+{
+    SIZE_T nameLen = 0;
+    SIZE_T currentOffset = offset;
+    BOOLEAN jumped = FALSE;
+    SIZE_T jumpCount = 0;
+    const SIZE_T MAX_JUMPS = 10;  // 무한 루프 방지
+
+    if (nameBuffer == NULL || nameBufferLen < 1) {
+        return 0;
+    }
+    nameBuffer[0] = '\0';
+
+    if (data == NULL || offset >= dataLen) {
+        return 0;
+    }
+
+    while (currentOffset < dataLen && jumpCount < MAX_JUMPS) {
+        UCHAR labelLen = data[currentOffset];
+
+        if (labelLen == 0) {
+            // 이름 끝
+            if (!jumped) {
+                currentOffset++;
+            }
+            break;
+        }
+
+        if ((labelLen & 0xC0) == 0xC0) {
+            // 압축 포인터
+            if (currentOffset + 1 >= dataLen) break;
+
+            SIZE_T ptrOffset = ((SIZE_T)(labelLen & 0x3F) << 8) | data[currentOffset + 1];
+
+            if (!jumped) {
+                // 첫 번째 점프: 원래 위치 기록
+                offset = currentOffset + 2;
+                jumped = TRUE;
+            }
+
+            currentOffset = ptrOffset;
+            jumpCount++;
+            continue;
+        }
+
+        // 일반 라벨
+        if (currentOffset + 1 + labelLen > dataLen) break;
+
+        if (nameLen > 0 && nameLen < nameBufferLen - 1) {
+            nameBuffer[nameLen++] = '.';
+        }
+
+        for (UCHAR j = 0; j < labelLen && nameLen < nameBufferLen - 1; j++) {
+            nameBuffer[nameLen++] = (CHAR)data[currentOffset + 1 + j];
+        }
+
+        currentOffset += 1 + labelLen;
+    }
+
+    nameBuffer[nameLen] = '\0';
+    ToLowerCase(nameBuffer, nameBufferLen);
+
+    return jumped ? (offset - offset + 2) : (currentOffset - offset);
+}
+
+// DNS 응답 수정 (싱크홀용)
+// 반환값: TRUE = 수정됨, FALSE = 수정 안됨
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN ModifyDnsResponseForSinkhole(
+    _Inout_updates_bytes_(dataLen) UCHAR * data,
+    _In_ SIZE_T dataLen
+)
+{
+    BOOLEAN modified = FALSE;
+    ULONG sinkholeIp;
+    KIRQL oldIrql;
+
+    if (g_DriverContext == NULL || data == NULL || dataLen < 12) {
+        return FALSE;
+    }
+
+    // 싱크홀이 비활성화되어 있으면 종료
+    if (g_DriverContext->DnsSinkholeEnabled == 0) {
+        return FALSE;
+    }
+
+    // 싱크홀 IP 가져오기
+    KeAcquireSpinLock(&g_DriverContext->DnsSinkholeLock, &oldIrql);
+    sinkholeIp = g_DriverContext->SinkholeIp;
+    KeReleaseSpinLock(&g_DriverContext->DnsSinkholeLock, oldIrql);
+
+    // DNS Header 확인
+    USHORT flags = ((USHORT)data[2] << 8) | data[3];
+    if (!(flags & 0x8000)) {  // QR 비트가 0이면 쿼리
+        return FALSE;
+    }
+    if ((flags & 0x000F) != 0) {  // RCODE != 0이면 에러
+        return FALSE;
+    }
+
+    USHORT qdCount = ((USHORT)data[4] << 8) | data[5];
+    USHORT anCount = ((USHORT)data[6] << 8) | data[7];
+
+    if (anCount == 0) {
+        return FALSE;
+    }
+
+    SIZE_T offset = 12;
+
+    // Question 섹션 건너뛰기
+    for (USHORT i = 0; i < qdCount && offset < dataLen; i++) {
+        while (offset < dataLen && data[offset] != 0) {
+            if ((data[offset] & 0xC0) == 0xC0) {
+                offset += 2;
+                goto skip_question;
+            }
+            offset += 1 + data[offset];
+        }
+        offset++;
+    skip_question:
+        offset += 4;  // QTYPE + QCLASS
+    }
+
+    // Answer 섹션 파싱 및 수정
+    CHAR domainName[MAX_SNI_LENGTH];
+
+    for (USHORT i = 0; i < anCount && offset + 12 <= dataLen; i++) {
+        domainName[0] = '\0';
+
+
+        // 도메인 이름 추출
+        SIZE_T nameOffset = offset;
+        SIZE_T nameLen = 0;
+
+        while (nameOffset < dataLen && data[nameOffset] != 0) {
+            if ((data[nameOffset] & 0xC0) == 0xC0) {
+                // 압축 포인터
+                if (nameOffset + 1 >= dataLen) break;
+                SIZE_T ptrOffset = ((SIZE_T)(data[nameOffset] & 0x3F) << 8) | data[nameOffset + 1];
+
+                // 포인터가 가리키는 위치에서 이름 추출
+                while (ptrOffset < dataLen && data[ptrOffset] != 0) {
+                    UCHAR labelLen = data[ptrOffset];
+                    if ((labelLen & 0xC0) == 0xC0) break;
+                    if (ptrOffset + 1 + labelLen > dataLen) break;
+
+                    if (nameLen > 0 && nameLen < MAX_SNI_LENGTH - 1) {
+                        domainName[nameLen++] = '.';
+                    }
+                    for (UCHAR j = 0; j < labelLen && nameLen < MAX_SNI_LENGTH - 1; j++) {
+                        domainName[nameLen++] = (CHAR)data[ptrOffset + 1 + j];
+                    }
+                    ptrOffset += 1 + labelLen;
+                }
+
+                offset += 2;
+                goto parse_answer;
+            }
+
+            UCHAR labelLen = data[nameOffset];
+            if (nameOffset + 1 + labelLen > dataLen) break;
+
+            if (nameLen > 0 && nameLen < MAX_SNI_LENGTH - 1) {
+                domainName[nameLen++] = '.';
+            }
+            for (UCHAR j = 0; j < labelLen && nameLen < MAX_SNI_LENGTH - 1; j++) {
+                domainName[nameLen++] = (CHAR)data[nameOffset + 1 + j];
+            }
+            nameOffset += 1 + labelLen;
+        }
+
+        if (nameOffset < dataLen && data[nameOffset] == 0) {
+            offset = nameOffset + 1;
+        }
+
+    parse_answer:
+        domainName[nameLen] = '\0';
+        ToLowerCase(domainName, MAX_SNI_LENGTH);
+
+        if (offset + 10 > dataLen) break;
+
+        USHORT rrType = ((USHORT)data[offset] << 8) | data[offset + 1];
+        offset += 2;  // TYPE
+        offset += 2;  // CLASS
+        offset += 4;  // TTL
+        USHORT rdLength = ((USHORT)data[offset] << 8) | data[offset + 1];
+        offset += 2;
+
+        if (offset + rdLength > dataLen) break;
+
+        // A 레코드 (IPv4) 이고 차단 대상 도메인인 경우 IP 수정
+        if (rrType == 1 && rdLength == 4) {
+            if (domainName[0] != '\0' && IsSniInBlockList(domainName)) {
+                // 기존 IP 로깅
+                ULONG originalIp = ((ULONG)data[offset] << 24) |
+                    ((ULONG)data[offset + 1] << 16) |
+                    ((ULONG)data[offset + 2] << 8) |
+                    data[offset + 3];
+
+                // 싱크홀 IP로 수정 (네트워크 바이트 오더로 변환)
+                data[offset] = (UCHAR)((sinkholeIp >> 24) & 0xFF);
+                data[offset + 1] = (UCHAR)((sinkholeIp >> 16) & 0xFF);
+                data[offset + 2] = (UCHAR)((sinkholeIp >> 8) & 0xFF);
+                data[offset + 3] = (UCHAR)(sinkholeIp & 0xFF);
+
+                modified = TRUE;
+                InterlockedIncrement64(&g_DriverContext->TotalDnsModified);
+
+                KdPrint(("WFP DNS Sinkhole: Modified %s: %u.%u.%u.%u -> %u.%u.%u.%u\n",
+                    domainName,
+                    (originalIp >> 24) & 0xFF, (originalIp >> 16) & 0xFF,
+                    (originalIp >> 8) & 0xFF, originalIp & 0xFF,
+                    (sinkholeIp >> 24) & 0xFF, (sinkholeIp >> 16) & 0xFF,
+                    (sinkholeIp >> 8) & 0xFF, sinkholeIp & 0xFF));
+            }
+        }
+
+        offset += rdLength;
+    }
+
+    return modified;
 }
 
 // ============================================================================
@@ -1461,9 +1807,12 @@ void NTAPI FilterClassifyConnect(
     }
 
     // HTTPS/QUIC 포트(443)로 나가는 연결에 대해 IP 캐시 확인
+    // 단, 루프백 주소(127.0.0.0/8)는 제외 (싱크홀 서버 연결 허용)
     if (!shouldBlock && g_DriverContext->SniBlockingEnabled && remotePort == 443) {
-        if (IsIpBlocked(remoteAddress)) {
+        // 버그 수정: IsIpBlockedWithSniIncrement 사용하여 연관된 SNI의 차단 횟수도 증가시킴
+        if (!IsLoopbackAddress(remoteAddress) && IsIpBlockedWithSniIncrement(remoteAddress)) {
             shouldBlock = TRUE;
+            InterlockedIncrement64(&g_DriverContext->DnsBlocked);  // IP 캐시 기반 차단 통계
             KdPrint(("WFP Connect: Blocking %s connection to cached IP %u.%u.%u.%u:443 (PID=%llu)\n",
                 (protocol == PROTO_TCP) ? "TCP" : "UDP",
                 (remoteAddress >> 24) & 0xFF,
@@ -1497,7 +1846,8 @@ void NTAPI FilterClassifyConnect(
 
         packetInfo.Action = shouldBlock ? PACKET_ACTION_BLOCK : PACKET_ACTION_PERMIT;
 
-        if (shouldCapture) {
+        // 버그 수정: 차단된 패킷도 캡처 여부와 관계없이 큐에 추가
+        if (shouldCapture || shouldBlock) {
             EnqueuePacket(&packetInfo);
             InterlockedIncrement64(&g_DriverContext->TotalCaptured);
         }
@@ -1530,8 +1880,11 @@ void NTAPI FilterClassifyStream(
     CHAR sniBuffer[MAX_SNI_LENGTH];
     BOOLEAN shouldBlock = FALSE;
     ULONG remoteIp = 0;
+    ULONG localIp = 0;
+    USHORT remotePort = 0;
+    USHORT localPort = 0;
+    UINT64 processPid = 0;
 
-    UNREFERENCED_PARAMETER(inMetaValues);
     UNREFERENCED_PARAMETER(classifyContext);
     UNREFERENCED_PARAMETER(filter);
     UNREFERENCED_PARAMETER(flowContext);
@@ -1549,12 +1902,35 @@ void NTAPI FilterClassifyStream(
         return;
     }
 
-    // Remote IP 추출
+    // PID 추출 (버그 수정: inMetaValues 사용)
+    if (inMetaValues != NULL &&
+        (inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID) != 0) {
+        processPid = inMetaValues->processId;
+    }
+
+    // IP/Port 정보 추출
     if (inFixedValues != NULL && inFixedValues->incomingValue != NULL) {
         if (inFixedValues->valueCount > FWPS_FIELD_STREAM_V4_IP_REMOTE_ADDRESS) {
             remoteIp = inFixedValues->incomingValue[
                 FWPS_FIELD_STREAM_V4_IP_REMOTE_ADDRESS].value.uint32;
         }
+        if (inFixedValues->valueCount > FWPS_FIELD_STREAM_V4_IP_LOCAL_ADDRESS) {
+            localIp = inFixedValues->incomingValue[
+                FWPS_FIELD_STREAM_V4_IP_LOCAL_ADDRESS].value.uint32;
+        }
+        if (inFixedValues->valueCount > FWPS_FIELD_STREAM_V4_IP_REMOTE_PORT) {
+            remotePort = inFixedValues->incomingValue[
+                FWPS_FIELD_STREAM_V4_IP_REMOTE_PORT].value.uint16;
+        }
+        if (inFixedValues->valueCount > FWPS_FIELD_STREAM_V4_IP_LOCAL_PORT) {
+            localPort = inFixedValues->incomingValue[
+                FWPS_FIELD_STREAM_V4_IP_LOCAL_PORT].value.uint16;
+        }
+    }
+
+    // 루프백 주소는 검사하지 않음 (싱크홀 서버 연결 허용)
+    if (IsLoopbackAddress(remoteIp)) {
+        return;
     }
 
     streamPacket = (FWPS_STREAM_CALLOUT_IO_PACKET0*)layerData;
@@ -1620,6 +1996,25 @@ void NTAPI FilterClassifyStream(
         // 스트림 연결 즉시 드롭
         streamPacket->streamAction = FWPS_STREAM_ACTION_DROP_CONNECTION;
         streamPacket->countBytesEnforced = 0;
+
+        // 버그 수정: 차단된 패킷 정보를 큐에 추가하여 UI에 표시
+        {
+            PACKET_INFO packetInfo = { 0 };
+            packetInfo.Timestamp = GetCurrentTimestamp();
+            packetInfo.ProcessId = (ULONG)processPid;
+            packetInfo.LocalAddress = localIp;
+            packetInfo.RemoteAddress = remoteIp;
+            packetInfo.LocalPort = localPort;
+            packetInfo.RemotePort = remotePort;
+            packetInfo.Protocol = PROTO_TCP;
+            packetInfo.Direction = PACKET_DIR_OUTBOUND;
+            packetInfo.Action = PACKET_ACTION_BLOCK;
+
+            EnqueuePacket(&packetInfo);
+            InterlockedIncrement64(&g_DriverContext->TotalCaptured);
+        }
+
+        InterlockedIncrement64(&g_DriverContext->TotalBlocked);
     }
 }
 
@@ -1638,9 +2033,12 @@ void NTAPI FilterClassifyQuic(
 )
 {
     ULONG remoteAddress = 0;
+    ULONG localAddress = 0;
     USHORT remotePort = 0;
+    USHORT localPort = 0;
     BOOLEAN shouldBlock = FALSE;
     CHAR sniBuffer[MAX_SNI_LENGTH];
+    UINT64 processPid = 0;
 
     UNREFERENCED_PARAMETER(classifyContext);
     UNREFERENCED_PARAMETER(filter);
@@ -1661,7 +2059,13 @@ void NTAPI FilterClassifyQuic(
         return;
     }
 
-    // Remote IP/Port 추출
+    // PID 추출 (버그 수정)
+    if (inMetaValues != NULL &&
+        (inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID) != 0) {
+        processPid = inMetaValues->processId;
+    }
+
+    // IP/Port 정보 추출
     if (inFixedValues->valueCount > FWPS_FIELD_DATAGRAM_DATA_V4_IP_REMOTE_ADDRESS) {
         remoteAddress = inFixedValues->incomingValue[
             FWPS_FIELD_DATAGRAM_DATA_V4_IP_REMOTE_ADDRESS].value.uint32;
@@ -1670,14 +2074,27 @@ void NTAPI FilterClassifyQuic(
         remotePort = inFixedValues->incomingValue[
             FWPS_FIELD_DATAGRAM_DATA_V4_IP_REMOTE_PORT].value.uint16;
     }
+    if (inFixedValues->valueCount > FWPS_FIELD_DATAGRAM_DATA_V4_IP_LOCAL_ADDRESS) {
+        localAddress = inFixedValues->incomingValue[
+            FWPS_FIELD_DATAGRAM_DATA_V4_IP_LOCAL_ADDRESS].value.uint32;
+    }
+    if (inFixedValues->valueCount > FWPS_FIELD_DATAGRAM_DATA_V4_IP_LOCAL_PORT) {
+        localPort = inFixedValues->incomingValue[
+            FWPS_FIELD_DATAGRAM_DATA_V4_IP_LOCAL_PORT].value.uint16;
+    }
 
     // UDP 443 (QUIC) 트래픽 확인
     if (remotePort != 443) {
         return;
     }
 
-    // 먼저 IP 캐시 확인
-    if (IsIpBlocked(remoteAddress)) {
+    // 루프백 주소는 검사하지 않음 (싱크홀 서버 연결 허용)
+    if (IsLoopbackAddress(remoteAddress)) {
+        return;
+    }
+
+    // 먼저 IP 캐시 확인 (버그 수정: IsIpBlockedWithSniIncrement 사용)
+    if (IsIpBlockedWithSniIncrement(remoteAddress)) {
         shouldBlock = TRUE;
         InterlockedIncrement64(&g_DriverContext->QuicTotalBlocked);
         KdPrint(("WFP QUIC: Blocking cached IP %u.%u.%u.%u:443\n",
@@ -1748,11 +2165,30 @@ void NTAPI FilterClassifyQuic(
     if (shouldBlock) {
         classifyOut->actionType = FWP_ACTION_BLOCK;
         classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
+
+        // 버그 수정: 차단된 패킷 정보를 큐에 추가하여 UI에 표시
+        {
+            PACKET_INFO packetInfo = { 0 };
+            packetInfo.Timestamp = GetCurrentTimestamp();
+            packetInfo.ProcessId = (ULONG)processPid;
+            packetInfo.LocalAddress = localAddress;
+            packetInfo.RemoteAddress = remoteAddress;
+            packetInfo.LocalPort = localPort;
+            packetInfo.RemotePort = remotePort;
+            packetInfo.Protocol = PROTO_UDP;
+            packetInfo.Direction = PACKET_DIR_OUTBOUND;
+            packetInfo.Action = PACKET_ACTION_BLOCK;
+
+            EnqueuePacket(&packetInfo);
+            InterlockedIncrement64(&g_DriverContext->TotalCaptured);
+        }
+
+        InterlockedIncrement64(&g_DriverContext->TotalBlocked);
     }
 }
 
 // ============================================================================
-// DNS 모니터링 콜백 (신규)
+// DNS 모니터링 및 싱크홀 콜백 (v3.0 개선)
 // ============================================================================
 
 void NTAPI FilterClassifyDns(
@@ -1766,6 +2202,7 @@ void NTAPI FilterClassifyDns(
 )
 {
     USHORT remotePort = 0;
+    ULONG direction = 0;
 
     UNREFERENCED_PARAMETER(inMetaValues);
     UNREFERENCED_PARAMETER(classifyContext);
@@ -1793,8 +2230,16 @@ void NTAPI FilterClassifyDns(
             FWPS_FIELD_DATAGRAM_DATA_V4_IP_REMOTE_PORT].value.uint16;
     }
 
-    // 인바운드 DNS 응답 (소스 포트 53)은 별도 처리 필요
-    // 여기서는 INBOUND 방향의 패킷을 감시
+    // 방향 확인 (인바운드만 처리)
+    if (inFixedValues->valueCount > FWPS_FIELD_DATAGRAM_DATA_V4_DIRECTION) {
+        direction = inFixedValues->incomingValue[
+            FWPS_FIELD_DATAGRAM_DATA_V4_DIRECTION].value.uint32;
+    }
+
+    // 인바운드 DNS 응답만 처리 (FWP_DIRECTION_INBOUND = 1)
+    if (direction != FWP_DIRECTION_INBOUND) {
+        return;
+    }
 
     if (layerData != NULL) {
         NET_BUFFER_LIST* nbl = (NET_BUFFER_LIST*)layerData;
@@ -1806,21 +2251,50 @@ void NTAPI FilterClassifyDns(
                 ULONG dataLength = NET_BUFFER_DATA_LENGTH(nb);
 
                 if (dataLength >= 12 && dataLength < 4096) {
-                    UCHAR* dataBuffer = (UCHAR*)ExAllocatePool2(
-                        POOL_FLAG_NON_PAGED,
-                        dataLength,
-                        'DNSB'
-                    );
+                    // DNS 싱크홀이 활성화된 경우 패킷 직접 수정 시도
+                    if (g_DriverContext->DnsSinkholeEnabled != 0) {
+                        // MDL을 통해 실제 데이터에 접근
+                        MDL* mdl = NET_BUFFER_CURRENT_MDL(nb);
+                        ULONG mdlOffset = NET_BUFFER_CURRENT_MDL_OFFSET(nb);
 
-                    if (dataBuffer != NULL) {
-                        UCHAR* mappedData = (UCHAR*)NdisGetDataBuffer(
-                            nb, dataLength, dataBuffer, 1, 0);
+                        if (mdl != NULL) {
+                            UCHAR* mdlData = (UCHAR*)MmGetSystemAddressForMdlSafe(
+                                mdl, NormalPagePriority | MdlMappingNoExecute);
 
-                        if (mappedData != NULL) {
-                            ParseDnsResponseForBlocking(mappedData, dataLength);
+                            if (mdlData != NULL) {
+                                UCHAR* dnsData = mdlData + mdlOffset;
+                                ULONG availableLen = MmGetMdlByteCount(mdl) - mdlOffset;
+
+                                if (availableLen >= dataLength) {
+                                    // 싱크홀 수정 시도
+                                    if (ModifyDnsResponseForSinkhole(dnsData, dataLength)) {
+                                        KdPrint(("WFP DNS Sinkhole: Packet modified in-place\n"));
+                                    }
+
+                                    // IP 캐싱도 수행 (원본 IP가 아닌 수정된 IP로 캐싱됨)
+                                    ParseDnsResponseForBlocking(dnsData, dataLength);
+                                }
+                            }
                         }
+                    }
+                    else {
+                        // 싱크홀 비활성화 시 기존 방식으로 IP 캐싱만 수행
+                        UCHAR* dataBuffer = (UCHAR*)ExAllocatePool2(
+                            POOL_FLAG_NON_PAGED,
+                            dataLength,
+                            'DNSB'
+                        );
 
-                        ExFreePoolWithTag(dataBuffer, 'DNSB');
+                        if (dataBuffer != NULL) {
+                            UCHAR* mappedData = (UCHAR*)NdisGetDataBuffer(
+                                nb, dataLength, dataBuffer, 1, 0);
+
+                            if (mappedData != NULL) {
+                                ParseDnsResponseForBlocking(mappedData, dataLength);
+                            }
+
+                            ExFreePoolWithTag(dataBuffer, 'DNSB');
+                        }
                     }
                 }
             }
@@ -2476,6 +2950,74 @@ NTSTATUS DispatchDeviceControl(
         break;
     }
 
+    // ========================================================================
+    // DNS 싱크홀 IOCTL (v3.0 신규)
+    // ========================================================================
+    case IOCTL_WFP_DNS_SINKHOLE_TOGGLE:
+    {
+        PDNS_SINKHOLE_TOGGLE pToggle = (PDNS_SINKHOLE_TOGGLE)inputBuffer;
+
+        if (pToggle == NULL || inputLength < sizeof(DNS_SINKHOLE_TOGGLE)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        g_DriverContext->DnsSinkholeEnabled = pToggle->Enable;
+        KdPrint(("WFP DNS Sinkhole: %s\n", pToggle->Enable ? "enabled" : "disabled"));
+        break;
+    }
+
+    case IOCTL_WFP_DNS_SINKHOLE_SET_IP:
+    {
+        PDNS_SINKHOLE_CONFIG pConfig = (PDNS_SINKHOLE_CONFIG)inputBuffer;
+        KIRQL oldIrql;
+
+        if (pConfig == NULL || inputLength < sizeof(DNS_SINKHOLE_CONFIG)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        KeAcquireSpinLock(&g_DriverContext->DnsSinkholeLock, &oldIrql);
+        g_DriverContext->SinkholeIp = pConfig->SinkholeIp;
+        g_DriverContext->SinkholeHttpPort = pConfig->HttpPort;
+        g_DriverContext->SinkholeHttpsPort = pConfig->HttpsPort;
+        KeReleaseSpinLock(&g_DriverContext->DnsSinkholeLock, oldIrql);
+
+        KdPrint(("WFP DNS Sinkhole: IP set to %u.%u.%u.%u, HTTP:%u, HTTPS:%u\n",
+            (pConfig->SinkholeIp >> 24) & 0xFF,
+            (pConfig->SinkholeIp >> 16) & 0xFF,
+            (pConfig->SinkholeIp >> 8) & 0xFF,
+            pConfig->SinkholeIp & 0xFF,
+            pConfig->HttpPort, pConfig->HttpsPort));
+        break;
+    }
+
+    case IOCTL_WFP_DNS_SINKHOLE_GET_STATUS:
+    {
+        PDNS_SINKHOLE_STATUS pStatus = (PDNS_SINKHOLE_STATUS)outputBuffer;
+        KIRQL oldIrql;
+
+        if (pStatus == NULL || outputLength < sizeof(DNS_SINKHOLE_STATUS)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        RtlZeroMemory(pStatus, sizeof(DNS_SINKHOLE_STATUS));
+
+        KeAcquireSpinLock(&g_DriverContext->DnsSinkholeLock, &oldIrql);
+        pStatus->Enabled = g_DriverContext->DnsSinkholeEnabled;
+        pStatus->SinkholeIp = g_DriverContext->SinkholeIp;
+        pStatus->HttpPort = g_DriverContext->SinkholeHttpPort;
+        pStatus->HttpsPort = g_DriverContext->SinkholeHttpsPort;
+        KeReleaseSpinLock(&g_DriverContext->DnsSinkholeLock, oldIrql);
+
+        pStatus->TotalRedirected = (ULONGLONG)g_DriverContext->TotalSinkholeRedirected;
+        pStatus->TotalDnsModified = (ULONGLONG)g_DriverContext->TotalDnsModified;
+
+        information = sizeof(DNS_SINKHOLE_STATUS);
+        break;
+    }
+
     default:
         status = STATUS_INVALID_DEVICE_REQUEST;
         break;
@@ -2603,6 +3145,12 @@ NTSTATUS DriverEntry(
     status = InitializeIpCache();
     if (!NT_SUCCESS(status)) {
         KdPrint(("WFP: InitializeIpCache failed: 0x%08X\n", status));
+        goto Cleanup;
+    }
+
+    status = InitializeDnsSinkhole();
+    if (!NT_SUCCESS(status)) {
+        KdPrint(("WFP: InitializeDnsSinkhole failed: 0x%08X\n", status));
         goto Cleanup;
     }
 
