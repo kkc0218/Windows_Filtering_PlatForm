@@ -1,5 +1,5 @@
 // ============================================================================
-// sample_fixed.c - WFP Packet Filtering & Capture Kernel Driver 
+// sample.c - WFP Packet Filtering & Capture Kernel Driver 
 // ============================================================================
 
 #include <ntddk.h>
