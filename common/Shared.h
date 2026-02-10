@@ -38,22 +38,22 @@ DEFINE_GUID(GUID_MY_WFP_CALLOUT,
 DEFINE_GUID(GUID_MY_WFP_SNI_CALLOUT,
     0xc291a11f, 0xca4a, 0x4f75, 0xa2, 0x3b, 0x74, 0x88, 0x97, 0x35, 0xc1, 0x4c);
 
-// QUIC 차단 Callout (DATAGRAM_DATA_V4) - QUIC Initial 패킷 SNI 파싱용 (v3.0 신규)
+// QUIC 차단 Callout (DATAGRAM_DATA_V4) - QUIC Initial 패킷 SNI 파싱용 
 // {D382B22F-E5B1-4C6F-B430-56789ABCDE01}
 DEFINE_GUID(GUID_MY_WFP_QUIC_CALLOUT,
     0xd382b22f, 0xe5b1, 0x4c6f, 0xb4, 0x30, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0x01);
 
-// DNS 모니터링 Callout (DATAGRAM_DATA_V4) - DNS 응답 모니터링용 (v3.0 신규)
+// DNS 모니터링 Callout (DATAGRAM_DATA_V4) - DNS 응답 모니터링용 
 // {E493C330-F6C2-4D70-C541-67890BCDEF12}
 DEFINE_GUID(GUID_MY_WFP_DNS_CALLOUT,
     0xe493c330, 0xf6c2, 0x4d70, 0xc5, 0x41, 0x67, 0x89, 0x0b, 0xcd, 0xef, 0x12);
 
-// ALE Flow Established Callout (v3.0 신규)
+// ALE Flow Established Callout 
 // {F5A4D441-A7E3-5E81-D652-789A1CDEF023}
 DEFINE_GUID(GUID_MY_WFP_FLOW_CALLOUT,
     0xf5a4d441, 0xa7e3, 0x5e81, 0xd6, 0x52, 0x78, 0x9a, 0x1c, 0xde, 0xf0, 0x23);
 
-// DNS Sinkhole Callout (v3.0 신규) - DNS 응답 수정용
+// DNS Sinkhole Callout - DNS 응답 수정용
 // {A6B5E552-B8F4-6F92-E763-89AB2DEF1234}
 DEFINE_GUID(GUID_MY_WFP_DNS_SINKHOLE_CALLOUT,
     0xa6b5e552, 0xb8f4, 0x6f92, 0xe7, 0x63, 0x89, 0xab, 0x2d, 0xef, 0x12, 0x34);
