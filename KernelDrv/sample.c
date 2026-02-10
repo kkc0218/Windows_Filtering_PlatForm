@@ -92,7 +92,6 @@ NTSTATUS NTAPI FilterNotifyDns(
     _Inout_ FWPS_FILTER1* filter
 );
 
-// SNI 차단 관련 전방 선언 (버그 수정: IsIpBlockedWithSniIncrement에서 사용)
 BOOLEAN IsSniBlocked(_In_ const CHAR* sni);
 
 // ============================================================================
