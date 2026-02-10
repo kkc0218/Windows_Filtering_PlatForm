@@ -1,15 +1,5 @@
 // ============================================================================
-// sample_fixed.c - WFP Packet Filtering & Capture Kernel Driver (Ultimate Fix)
-// ============================================================================
-// Windows Filtering Platform 기반 패킷 필터링 및 캡처 드라이버
-// 
-// [핵심 수정사항 - SNI 차단 완벽 작동을 위한 개선]
-// 1. QUIC Initial 패킷에서 SNI 직접 파싱 추가
-// 2. DNS 응답 모니터링을 통한 IP 사전 캐시
-// 3. TCP RST를 통한 즉시 연결 종료
-// 4. ALE_FLOW_ESTABLISHED 레이어 추가 (TLS가 시작되기 전 차단 시도)
-// 5. IP 캐시 TTL 증가 (5분 -> 30분) 및 용량 증가
-// 6. SNI 리스트 조회 버그 수정
+// sample_fixed.c - WFP Packet Filtering & Capture Kernel Driver 
 // ============================================================================
 
 #include <ntddk.h>
@@ -29,16 +19,6 @@
 #pragma comment(lib, "fwpkclnt.lib")
 #pragma comment(lib, "ndis.lib")
 
-// ============================================================================
-// 참고: GUID 및 주요 상수는 Shared.h에서 정의됨
-// - GUID_MY_WFP_CALLOUT, GUID_MY_WFP_SNI_CALLOUT
-// - GUID_MY_WFP_QUIC_CALLOUT, GUID_MY_WFP_DNS_CALLOUT, GUID_MY_WFP_FLOW_CALLOUT
-// - MAX_BLOCKED_IPS, IP_CACHE_TIMEOUT_SEC, QUIC_* 상수들
-// ============================================================================
-
-// ============================================================================
-// 전방 선언
-// ============================================================================
 NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath);
 void DriverUnload(_In_ PDRIVER_OBJECT DriverObject);
 NTSTATUS DispatchCreateClose(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
@@ -215,7 +195,7 @@ typedef struct _DRIVER_CONTEXT {
     volatile LONG BatchSequence;
 
     // ============================================================================
-    // DNS 싱크홀 컨텍스트 (v3.0 신규)
+    // DNS 싱크홀 컨텍스트 
     // ============================================================================
     volatile ULONG DnsSinkholeEnabled;      // DNS 싱크홀 활성화 상태
     volatile ULONG SinkholeIp;              // 싱크홀 IP (호스트 바이트 오더)
@@ -1030,7 +1010,7 @@ BOOLEAN ExtractSniFromTlsClientHello(
 }
 
 // ============================================================================
-// QUIC Initial 패킷에서 SNI 파싱 (핵심 신규 기능)
+// QUIC Initial 패킷에서 SNI 파싱 
 // ============================================================================
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -1150,7 +1130,7 @@ BOOLEAN ExtractSniFromQuicInitial(
     // QUIC Initial의 페이로드는 암호화되어 있지만, ClientHello의 SNI는
     // CRYPTO 프레임 내 평문으로 존재 (Initial 키는 DCID에서 파생)
     // 
-    // 주의: 완전한 QUIC 복호화는 복잡하므로, 여기서는 패턴 매칭 시도
+    // 완전한 QUIC 복호화는 복잡하므로, 여기서는 패턴 매칭 시도
     // SNI는 TLS ClientHello 내에 평문으로 있어서 패턴 검색 가능
 
     // 나머지 데이터에서 SNI 패턴 검색
@@ -1208,7 +1188,7 @@ BOOLEAN ExtractSniFromQuicInitial(
 }
 
 // ============================================================================
-// DNS 응답에서 도메인과 IP 추출 (신규)
+// DNS 응답에서 도메인과 IP 추출 
 // ============================================================================
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -1349,7 +1329,7 @@ void ParseDnsResponseForBlocking(
 }
 
 // ============================================================================
-// DNS 싱크홀 함수 (v3.0 신규)
+// DNS 싱크홀 함수 
 // ============================================================================
 
 // DNS 싱크홀 초기화
@@ -1736,9 +1716,6 @@ void ClearPacketQueueInternal(void)
     KeLowerIrql(oldIrql);
 }
 
-// ============================================================================
-// WFP Classify 콜백 - ALE_AUTH_CONNECT_V4 (개선)
-// ============================================================================
 
 void NTAPI FilterClassifyConnect(
     _In_ const FWPS_INCOMING_VALUES0 * inFixedValues,
@@ -1862,7 +1839,7 @@ void NTAPI FilterClassifyConnect(
 }
 
 // ============================================================================
-// SNI Stream Classify 콜백 (개선)
+// SNI Stream Classify 콜백 
 // ============================================================================
 
 void NTAPI FilterClassifyStream(
@@ -2019,7 +1996,7 @@ void NTAPI FilterClassifyStream(
 }
 
 // ============================================================================
-// QUIC 차단 콜백 (개선 - SNI 파싱 추가)
+// QUIC 차단 콜백 
 // ============================================================================
 
 void NTAPI FilterClassifyQuic(
@@ -2951,7 +2928,7 @@ NTSTATUS DispatchDeviceControl(
     }
 
     // ========================================================================
-    // DNS 싱크홀 IOCTL (v3.0 신규)
+    // DNS 싱크홀 IOCTL 
     // ========================================================================
     case IOCTL_WFP_DNS_SINKHOLE_TOGGLE:
     {
