@@ -94,6 +94,40 @@ NTSTATUS NTAPI FilterNotifyDns(
 
 BOOLEAN IsSniBlocked(_In_ const CHAR* sni);
 
+// v5.0: ALE Flow Established 콜백 + Flow Delete 콜백
+void NTAPI FilterClassifyFlowEstablished(
+    _In_ const FWPS_INCOMING_VALUES0* inFixedValues,
+    _In_ const FWPS_INCOMING_METADATA_VALUES0* inMetaValues,
+    _Inout_opt_ void* layerData,
+    _In_opt_ const void* classifyContext,
+    _In_ const FWPS_FILTER1* filter,
+    _In_ UINT64 flowContext,
+    _Inout_ FWPS_CLASSIFY_OUT0* classifyOut
+);
+
+NTSTATUS NTAPI FilterNotifyFlowEstablished(
+    _In_ FWPS_CALLOUT_NOTIFY_TYPE notifyType,
+    _In_ const GUID* filterKey,
+    _Inout_ FWPS_FILTER1* filter
+);
+
+void NTAPI FlowDeleteCallback(
+    _In_ UINT16 layerId,
+    _In_ UINT32 calloutId,
+    _In_ UINT64 flowContext
+);
+
+// v5.0: Flow Context Lookup Table 함수 전방 선언
+struct _UPLOAD_FLOW_CONTEXT;  // 구조체 전방 선언
+void InitFlowContextLookup(void);
+struct _UPLOAD_FLOW_CONTEXT* FindFlowContextByFlowId(_In_ UINT64 flowId);
+void RemoveFlowContextLookup(_In_ UINT64 flowId);
+
+// v5.2: Stream/QUIC 콜백에서 지연 생성 (Lazy Creation)
+struct _UPLOAD_FLOW_CONTEXT* CreateLazyFlowContext(
+    _In_ const FWPS_INCOMING_METADATA_VALUES0* inMetaValues
+);
+
 // ============================================================================
 // 메모리 섹션 설정
 // ============================================================================
@@ -170,6 +204,8 @@ typedef struct _DRIVER_CONTEXT {
     UINT64 FilterIdQuic;
     UINT32 CalloutIdDns;        // DNS 콜아웃 (신규)
     UINT64 FilterIdDns;
+    UINT32 CalloutIdFlow;       // v5.0: ALE Flow Established 콜아웃
+    UINT64 FilterIdFlow;
 
     // 설정
     volatile ULONG BlockedPid;
@@ -203,7 +239,89 @@ typedef struct _DRIVER_CONTEXT {
     volatile LONG64 TotalDnsModified;       // 수정된 DNS 응답 수
     volatile LONG64 TotalSinkholeRedirected;// 싱크홀로 리다이렉션된 연결 수
     KSPIN_LOCK DnsSinkholeLock;             // 싱크홀 설정 보호용 스핀락
+
+    // ============================================================================
+    // SNS 파일 업로드 DLP 컨텍스트 (v7.0 앱 기반 Flow Context)
+    // ============================================================================
+    volatile ULONG UploadBlockingEnabled;   // 업로드 차단 활성화 상태
+    volatile LONG64 UploadTotalBlocked;     // 업로드 차단 총 횟수
+    volatile ULONG UploadThresholdBytes;    // 업로드 차단 임계값 (바이트)
+    volatile ULONG UploadWindowSeconds;     // 측정 윈도우 (초)
 } DRIVER_CONTEXT, * PDRIVER_CONTEXT;
+
+// ============================================================================
+// v5.0: WFP Flow Context 구조체 (FwpsFlowAssociateContext0 용)
+// v7.0: 앱 기반 DLP - 도메인 매칭 없이 모니터링 앱의 모든 아웃바운드 추적
+// ============================================================================
+typedef struct _UPLOAD_FLOW_CONTEXT {
+    volatile LONG64 OutboundByteCount;      // 총 아웃바운드 바이트
+    volatile LONG64 WindowOutboundBytes;    // 현재 윈도우 내 누적 아웃바운드
+    LARGE_INTEGER WindowStart;              // 현재 측정 윈도우 시작
+    LARGE_INTEGER CreatedTime;              // 플로우 생성 시간
+    CHAR Sni[MAX_SNI_LENGTH];              // SNI 도메인 (디버그 로그용)
+    BOOLEAN IsMonitored;                    // 업로드 모니터링 활성 (모니터링 앱이면 항상 TRUE)
+    BOOLEAN Blocked;                        // 이미 차단된 플로우
+    BOOLEAN SniChecked;                     // SNI 검사 완료 여부 (로그용)
+    BOOLEAN Reserved1;                      // 정렬용 패딩
+    ULONG ProcessId;                        // 프로세스 ID
+    UINT64 FlowId;                          // WFP Flow Handle (Lookup Table 키)
+    CHAR AppName[MAX_APP_NAME_LENGTH];     // 앱 실행 파일명
+} UPLOAD_FLOW_CONTEXT, * PUPLOAD_FLOW_CONTEXT;
+
+// ============================================================================
+// v5.0: 모니터링 대상 앱 관리 구조체 (커널 모드)
+// ============================================================================
+typedef struct _MONITORED_APP_ENTRY_K {
+    CHAR AppName[MAX_APP_NAME_LENGTH];     // 앱 실행 파일명 (소문자)
+    volatile LONG ActiveFlows;              // 해당 앱의 활성 플로우 수
+    BOOLEAN InUse;
+} MONITORED_APP_ENTRY_K, * PMONITORED_APP_ENTRY_K;
+
+typedef struct _MONITORED_APP_LIST_K {
+    MONITORED_APP_ENTRY_K Entries[MAX_MONITORED_APPS];
+    KSPIN_LOCK Lock;
+    volatile LONG Count;
+} MONITORED_APP_LIST_K, * PMONITORED_APP_LIST_K;
+
+static PMONITORED_APP_LIST_K g_MonitoredAppList = NULL;
+static volatile LONG g_ActiveFlowContextCount = 0;
+
+// ============================================================================
+// v5.1: Flow Context Hash Lookup Table (교차 레이어 컨텍스트 O(1) 조회)
+// WFP의 FwpsFlowAssociateContext0은 같은 콜아웃에서만 접근 가능하므로
+// Stream/QUIC 레이어에서 ALE에서 설정한 컨텍스트를 조회하기 위한 해시 테이블
+// 
+// 성능 최적화:
+// - 해시 기반 O(1) 평균 조회 (vs 이전 O(n) 선형 스캔)
+// - Open addressing + linear probing (캐시 친화적)
+// - 일반적 부하(10~50 동시 플로우)에서 1~2회 probe로 조회 완료
+// ============================================================================
+#define FLOW_LOOKUP_SIZE      512       // Power of 2 (해시 테이블 크기)
+#define FLOW_LOOKUP_MASK      (FLOW_LOOKUP_SIZE - 1)
+
+typedef struct _FLOW_CONTEXT_LOOKUP_ENTRY {
+    UINT64 FlowId;
+    PUPLOAD_FLOW_CONTEXT Context;
+    BOOLEAN InUse;
+} FLOW_CONTEXT_LOOKUP_ENTRY;
+
+typedef struct _FLOW_CONTEXT_LOOKUP_TABLE {
+    FLOW_CONTEXT_LOOKUP_ENTRY Entries[FLOW_LOOKUP_SIZE];
+    KSPIN_LOCK Lock;
+    volatile LONG Count;
+} FLOW_CONTEXT_LOOKUP_TABLE, * PFLOW_CONTEXT_LOOKUP_TABLE;
+
+static FLOW_CONTEXT_LOOKUP_TABLE g_FlowContextLookup = { 0 };
+
+// FlowId → 해시 인덱스 (빠른 비트 믹싱)
+static __inline ULONG FlowIdHash(UINT64 flowId)
+{
+    UINT64 h = flowId;
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    return (ULONG)(h & FLOW_LOOKUP_MASK);
+}
 
 // ============================================================================
 // 전역 변수
@@ -518,13 +636,18 @@ BOOLEAN IsIpBlockedWithSniIncrement(_In_ ULONG ipAddress)
     return blocked;
 }
 
-// SNI에 연관된 IP 제거
+// SNI에 연관된 IP 제거 (서브도메인 매칭 지원)
+// BUG FIX: 기존에는 _stricmp 정확 매칭만 했으므로
+// 차단 규칙 "google.com"에 대해 IP 캐시의 AssociatedSni="www.google.com"이
+// 제거되지 않아 토글 해제 후에도 차단이 유지되었음.
+// IsSniBlocked/IsSniInBlockList과 동일한 서브도메인 매칭 로직 적용.
 _IRQL_requires_max_(DISPATCH_LEVEL)
 void RemoveIpsForSni(_In_ const CHAR* sni)
 {
     KLOCK_QUEUE_HANDLE lockHandle;
     PBLOCKED_IP_CACHE cache;
     CHAR normalizedSni[MAX_SNI_LENGTH];
+    LONG removedCount = 0;
 
     if (g_DriverContext == NULL || g_DriverContext->IpCache == NULL || sni == NULL) {
         return;
@@ -533,18 +656,54 @@ void RemoveIpsForSni(_In_ const CHAR* sni)
     cache = g_DriverContext->IpCache;
     NormalizeUrl(sni, normalizedSni, MAX_SNI_LENGTH);
 
+    if (normalizedSni[0] == '\0') {
+        return;
+    }
+
+    SIZE_T ruleLen = strlen(normalizedSni);
+
     KeAcquireInStackQueuedSpinLock(&cache->Lock, &lockHandle);
 
     for (LONG i = 0; i < MAX_BLOCKED_IPS; i++) {
-        if (cache->Entries[i].InUse) {
-            if (_stricmp(cache->Entries[i].AssociatedSni, normalizedSni) == 0) {
+        if (cache->Entries[i].InUse && cache->Entries[i].AssociatedSni[0] != '\0') {
+            CHAR normalizedCacheSni[MAX_SNI_LENGTH];
+            BOOLEAN shouldRemove = FALSE;
+
+            // IP 캐시의 AssociatedSni도 정규화하여 비교
+            NormalizeUrl(cache->Entries[i].AssociatedSni, normalizedCacheSni, MAX_SNI_LENGTH);
+
+            SIZE_T cacheLen = strlen(normalizedCacheSni);
+
+            // 정확한 매칭
+            if (_stricmp(normalizedCacheSni, normalizedSni) == 0) {
+                shouldRemove = TRUE;
+            }
+            // 서브도메인 매칭 (예: www.google.com → google.com 규칙으로 매칭)
+            else if (cacheLen > ruleLen + 1) {
+                const CHAR* suffix = normalizedCacheSni + (cacheLen - ruleLen);
+                if (normalizedCacheSni[cacheLen - ruleLen - 1] == '.' &&
+                    _stricmp(suffix, normalizedSni) == 0) {
+                    shouldRemove = TRUE;
+                }
+            }
+
+            if (shouldRemove) {
+                KdPrint(("WFP IP Cache: Removing IP %u.%u.%u.%u (SNI: %s) for rule: %s\n",
+                    (cache->Entries[i].IpAddress >> 24) & 0xFF,
+                    (cache->Entries[i].IpAddress >> 16) & 0xFF,
+                    (cache->Entries[i].IpAddress >> 8) & 0xFF,
+                    cache->Entries[i].IpAddress & 0xFF,
+                    cache->Entries[i].AssociatedSni, normalizedSni));
                 RtlZeroMemory(&cache->Entries[i], sizeof(BLOCKED_IP_ENTRY));
                 InterlockedDecrement(&cache->Count);
+                removedCount++;
             }
         }
     }
 
     KeReleaseInStackQueuedSpinLock(&lockHandle);
+
+    KdPrint(("WFP IP Cache: Removed %ld IPs for SNI rule: %s\n", removedCount, normalizedSni));
 }
 
 // ============================================================================
@@ -878,6 +1037,634 @@ void ClearSniBlockList(void)
     }
 
     KdPrint(("WFP SNI: Block list and IP cache cleared\n"));
+}
+
+// ============================================================================
+// SNS 파일 업로드 DLP 초기화 (v7.0 - 앱 기반 Flow Context)
+// ============================================================================
+
+// 업로드 DLP 초기화 (도메인 리스트 제거, 앱 기반만 유지)
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS InitializeUploadDlp(void)
+{
+    if (g_DriverContext == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    g_DriverContext->UploadBlockingEnabled = 0;
+    g_DriverContext->UploadTotalBlocked = 0;
+    g_DriverContext->UploadThresholdBytes = UPLOAD_DEFAULT_THRESHOLD;  // 100KB 테스트용
+    g_DriverContext->UploadWindowSeconds = UPLOAD_FLOW_WINDOW_SEC;     // 30초
+
+    // v5.0: 모니터링 앱 리스트 할당
+    g_MonitoredAppList = (PMONITORED_APP_LIST_K)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        sizeof(MONITORED_APP_LIST_K),
+        'MALW'
+    );
+
+    if (g_MonitoredAppList == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(g_MonitoredAppList, sizeof(MONITORED_APP_LIST_K));
+    KeInitializeSpinLock(&g_MonitoredAppList->Lock);
+    g_ActiveFlowContextCount = 0;
+
+    // Flow Context Lookup Table 초기화
+    InitFlowContextLookup();
+
+    KdPrint(("WFP Upload v7.0: Initialized (threshold=%lu bytes, window=%lu sec, app-only mode)\n",
+        g_DriverContext->UploadThresholdBytes, g_DriverContext->UploadWindowSeconds));
+    return STATUS_SUCCESS;
+}
+
+// 업로드 DLP 정리
+_IRQL_requires_max_(APC_LEVEL)
+void CleanupUploadDlp(void)
+{
+    // v5.0: 앱 리스트 해제 (Flow Context는 WFP가 FlowDeleteCallback으로 자동 정리)
+    if (g_MonitoredAppList != NULL) {
+        ExFreePoolWithTag(g_MonitoredAppList, 'MALW');
+        g_MonitoredAppList = NULL;
+    }
+}
+
+// ============================================================================
+// v5.0: 모니터링 대상 앱 관리 함수
+// ============================================================================
+
+// 앱 이름 정규화 (소문자 변환)
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN AddMonitoredApp(_In_ const CHAR* appName)
+{
+    KLOCK_QUEUE_HANDLE lockHandle;
+    CHAR normalizedName[MAX_APP_NAME_LENGTH];
+
+    if (g_MonitoredAppList == NULL || appName == NULL || appName[0] == '\0') {
+        return FALSE;
+    }
+
+    // 소문자 변환
+    RtlStringCchCopyA(normalizedName, MAX_APP_NAME_LENGTH, appName);
+    ToLowerCase(normalizedName, MAX_APP_NAME_LENGTH);
+
+    KeAcquireInStackQueuedSpinLock(&g_MonitoredAppList->Lock, &lockHandle);
+
+    // 중복 확인
+    for (LONG i = 0; i < MAX_MONITORED_APPS; i++) {
+        if (g_MonitoredAppList->Entries[i].InUse &&
+            _stricmp(g_MonitoredAppList->Entries[i].AppName, normalizedName) == 0) {
+            KeReleaseInStackQueuedSpinLock(&lockHandle);
+            return FALSE;  // 이미 존재
+        }
+    }
+
+    // 빈 슬롯에 추가
+    for (LONG i = 0; i < MAX_MONITORED_APPS; i++) {
+        if (!g_MonitoredAppList->Entries[i].InUse) {
+            RtlStringCchCopyA(g_MonitoredAppList->Entries[i].AppName, MAX_APP_NAME_LENGTH, normalizedName);
+            g_MonitoredAppList->Entries[i].ActiveFlows = 0;
+            g_MonitoredAppList->Entries[i].InUse = TRUE;
+            InterlockedIncrement(&g_MonitoredAppList->Count);
+            KeReleaseInStackQueuedSpinLock(&lockHandle);
+            KdPrint(("WFP App: Added monitored app: %s\n", normalizedName));
+            return TRUE;
+        }
+    }
+
+    KeReleaseInStackQueuedSpinLock(&lockHandle);
+    return FALSE;  // 슬롯 부족
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN RemoveMonitoredApp(_In_ const CHAR* appName)
+{
+    KLOCK_QUEUE_HANDLE lockHandle;
+
+    if (g_MonitoredAppList == NULL || appName == NULL) return FALSE;
+
+    KeAcquireInStackQueuedSpinLock(&g_MonitoredAppList->Lock, &lockHandle);
+
+    for (LONG i = 0; i < MAX_MONITORED_APPS; i++) {
+        if (g_MonitoredAppList->Entries[i].InUse &&
+            _stricmp(g_MonitoredAppList->Entries[i].AppName, appName) == 0) {
+            RtlZeroMemory(&g_MonitoredAppList->Entries[i], sizeof(MONITORED_APP_ENTRY_K));
+            InterlockedDecrement(&g_MonitoredAppList->Count);
+            KeReleaseInStackQueuedSpinLock(&lockHandle);
+            KdPrint(("WFP App: Removed monitored app: %s\n", appName));
+            return TRUE;
+        }
+    }
+
+    KeReleaseInStackQueuedSpinLock(&lockHandle);
+    return FALSE;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+void ClearMonitoredAppList(void)
+{
+    KLOCK_QUEUE_HANDLE lockHandle;
+
+    if (g_MonitoredAppList == NULL) return;
+
+    KeAcquireInStackQueuedSpinLock(&g_MonitoredAppList->Lock, &lockHandle);
+    for (LONG i = 0; i < MAX_MONITORED_APPS; i++) {
+        RtlZeroMemory(&g_MonitoredAppList->Entries[i], sizeof(MONITORED_APP_ENTRY_K));
+    }
+    g_MonitoredAppList->Count = 0;
+    KeReleaseInStackQueuedSpinLock(&lockHandle);
+
+    KdPrint(("WFP App: Cleared all monitored apps\n"));
+}
+
+// WFP App ID (디바이스 경로)에서 실행 파일명 추출
+// 예: \device\harddiskvolume3\program files\google\chrome\application\chrome.exe → chrome.exe
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN ExtractExeNameFromAppId(
+    _In_ const FWP_BYTE_BLOB* appId,
+    _Out_writes_z_(outLen) CHAR* outName,
+    _In_ SIZE_T outLen
+)
+{
+    WCHAR* wPath;
+    SIZE_T wLen;
+    SIZE_T lastSlash = 0;
+    BOOLEAN foundSlash = FALSE;
+
+    if (appId == NULL || appId->data == NULL || appId->size < 4 || outName == NULL || outLen < 2) {
+        return FALSE;
+    }
+
+    wPath = (WCHAR*)appId->data;
+    wLen = appId->size / sizeof(WCHAR);
+
+    // 마지막 백슬래시 위치 찾기
+    for (SIZE_T i = 0; i < wLen && wPath[i] != L'\0'; i++) {
+        if (wPath[i] == L'\\' || wPath[i] == L'/') {
+            lastSlash = i;
+            foundSlash = TRUE;
+        }
+    }
+
+    if (!foundSlash) {
+        lastSlash = 0;
+    }
+    else {
+        lastSlash++;  // 슬래시 다음 위치
+    }
+
+    // WCHAR → CHAR 변환 (ASCII 범위만)
+    SIZE_T j = 0;
+    for (SIZE_T i = lastSlash; i < wLen && wPath[i] != L'\0' && j < outLen - 1; i++) {
+        if (wPath[i] <= 127) {
+            outName[j++] = (CHAR)wPath[i];
+        }
+    }
+    outName[j] = '\0';
+
+    // 소문자 변환
+    ToLowerCase(outName, outLen);
+
+    return (j > 0);
+}
+
+// 앱이 모니터링 대상인지 확인
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN IsMonitoredApp(_In_ const CHAR* exeName)
+{
+    KLOCK_QUEUE_HANDLE lockHandle;
+
+    if (g_MonitoredAppList == NULL || exeName == NULL || exeName[0] == '\0') {
+        return FALSE;
+    }
+
+    if (g_MonitoredAppList->Count == 0) {
+        return FALSE;
+    }
+
+    KeAcquireInStackQueuedSpinLock(&g_MonitoredAppList->Lock, &lockHandle);
+
+    for (LONG i = 0; i < MAX_MONITORED_APPS; i++) {
+        if (g_MonitoredAppList->Entries[i].InUse &&
+            _stricmp(g_MonitoredAppList->Entries[i].AppName, exeName) == 0) {
+            KeReleaseInStackQueuedSpinLock(&lockHandle);
+            return TRUE;
+        }
+    }
+
+    KeReleaseInStackQueuedSpinLock(&lockHandle);
+    return FALSE;
+}
+
+// 앱별 활성 플로우 카운트 증감
+_IRQL_requires_max_(DISPATCH_LEVEL)
+void UpdateAppFlowCount(_In_ const CHAR* exeName, _In_ BOOLEAN increment)
+{
+    KLOCK_QUEUE_HANDLE lockHandle;
+
+    if (g_MonitoredAppList == NULL || exeName == NULL) return;
+
+    KeAcquireInStackQueuedSpinLock(&g_MonitoredAppList->Lock, &lockHandle);
+
+    for (LONG i = 0; i < MAX_MONITORED_APPS; i++) {
+        if (g_MonitoredAppList->Entries[i].InUse &&
+            _stricmp(g_MonitoredAppList->Entries[i].AppName, exeName) == 0) {
+            if (increment) {
+                InterlockedIncrement(&g_MonitoredAppList->Entries[i].ActiveFlows);
+            }
+            else {
+                LONG newVal = InterlockedDecrement(&g_MonitoredAppList->Entries[i].ActiveFlows);
+                if (newVal < 0) {
+                    g_MonitoredAppList->Entries[i].ActiveFlows = 0;
+                }
+            }
+            break;
+        }
+    }
+
+    KeReleaseInStackQueuedSpinLock(&lockHandle);
+}
+
+// 앱 프리셋 일괄 추가
+_IRQL_requires_max_(DISPATCH_LEVEL)
+ULONG AddAppPreset(_In_ ULONG presetType)
+{
+    ULONG addedCount = 0;
+
+    // 브라우저 프리셋
+    static const CHAR* browserApps[] = {
+        "chrome.exe", "msedge.exe", "firefox.exe",
+        "whale.exe", "opera.exe", "brave.exe", NULL
+    };
+
+    // 메신저 프리셋
+    static const CHAR* messengerApps[] = {
+        "kakaotalk.exe", "line.exe", "telegram.exe",
+        "slack.exe", "discord.exe", "wechat.exe", NULL
+    };
+
+    const CHAR** appList = NULL;
+
+    switch (presetType) {
+    case 0:  appList = browserApps; break;     // APP_PRESET_BROWSERS
+    case 1:  appList = messengerApps; break;   // APP_PRESET_MESSENGERS
+    case 99:                                    // APP_PRESET_ALL
+        addedCount += AddAppPreset(0);
+        addedCount += AddAppPreset(1);
+        return addedCount;
+    default: return 0;
+    }
+
+    if (appList == NULL) return 0;
+
+    for (ULONG i = 0; appList[i] != NULL; i++) {
+        if (AddMonitoredApp(appList[i])) {
+            addedCount++;
+        }
+    }
+
+    KdPrint(("WFP App: Added %lu apps from preset %lu\n", addedCount, presetType));
+    return addedCount;
+}
+
+// ============================================================================
+// v5.1: Flow Context Hash Lookup 헬퍼 함수 (Open Addressing + Linear Probing)
+// 평균 O(1) 조회, 캐시 친화적 메모리 레이아웃
+// ============================================================================
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+void InitFlowContextLookup(void)
+{
+    RtlZeroMemory(&g_FlowContextLookup, sizeof(FLOW_CONTEXT_LOOKUP_TABLE));
+    KeInitializeSpinLock(&g_FlowContextLookup.Lock);
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN AddFlowContextLookup(_In_ UINT64 flowId, _In_ PUPLOAD_FLOW_CONTEXT ctx)
+{
+    KLOCK_QUEUE_HANDLE lockHandle;
+    ULONG startIdx = FlowIdHash(flowId);
+    ULONG idx;
+
+    KeAcquireInStackQueuedSpinLock(&g_FlowContextLookup.Lock, &lockHandle);
+
+    for (ULONG probe = 0; probe < FLOW_LOOKUP_SIZE; probe++) {
+        idx = (startIdx + probe) & FLOW_LOOKUP_MASK;
+
+        if (!g_FlowContextLookup.Entries[idx].InUse) {
+            g_FlowContextLookup.Entries[idx].FlowId = flowId;
+            g_FlowContextLookup.Entries[idx].Context = ctx;
+            g_FlowContextLookup.Entries[idx].InUse = TRUE;
+            InterlockedIncrement(&g_FlowContextLookup.Count);
+            KeReleaseInStackQueuedSpinLock(&lockHandle);
+            return TRUE;
+        }
+    }
+
+    KeReleaseInStackQueuedSpinLock(&lockHandle);
+    KdPrint(("WFP FlowHash: Table full (%d/%d), cannot add flowId=%llu\n",
+        g_FlowContextLookup.Count, FLOW_LOOKUP_SIZE, flowId));
+    return FALSE;
+}
+
+// Hot path: Stream/QUIC 콜백에서 매 패킷마다 호출
+// 해시 기반이므로 평균 1~2회 probe로 조회 완료
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PUPLOAD_FLOW_CONTEXT FindFlowContextByFlowId(_In_ UINT64 flowId)
+{
+    KLOCK_QUEUE_HANDLE lockHandle;
+    PUPLOAD_FLOW_CONTEXT result = NULL;
+    ULONG startIdx = FlowIdHash(flowId);
+    ULONG idx;
+
+    KeAcquireInStackQueuedSpinLock(&g_FlowContextLookup.Lock, &lockHandle);
+
+    for (ULONG probe = 0; probe < FLOW_LOOKUP_SIZE; probe++) {
+        idx = (startIdx + probe) & FLOW_LOOKUP_MASK;
+
+        if (!g_FlowContextLookup.Entries[idx].InUse) {
+            break;  // 빈 슬롯 = 해당 flowId 없음
+        }
+        if (g_FlowContextLookup.Entries[idx].FlowId == flowId) {
+            result = g_FlowContextLookup.Entries[idx].Context;
+            break;
+        }
+    }
+
+    KeReleaseInStackQueuedSpinLock(&lockHandle);
+    return result;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+void RemoveFlowContextLookup(_In_ UINT64 flowId)
+{
+    KLOCK_QUEUE_HANDLE lockHandle;
+    ULONG startIdx = FlowIdHash(flowId);
+    ULONG idx;
+    ULONG removeIdx = (ULONG)-1;
+
+    KeAcquireInStackQueuedSpinLock(&g_FlowContextLookup.Lock, &lockHandle);
+
+    // 1: 해당 엔트리 찾기
+    for (ULONG probe = 0; probe < FLOW_LOOKUP_SIZE; probe++) {
+        idx = (startIdx + probe) & FLOW_LOOKUP_MASK;
+        if (!g_FlowContextLookup.Entries[idx].InUse) break;
+        if (g_FlowContextLookup.Entries[idx].FlowId == flowId) {
+            removeIdx = idx;
+            break;
+        }
+    }
+
+    if (removeIdx == (ULONG)-1) {
+        KeReleaseInStackQueuedSpinLock(&lockHandle);
+        return;
+    }
+
+    // 2: 삭제 후 후속 엔트리 재배치 (linear probing 무결성 유지)
+    g_FlowContextLookup.Entries[removeIdx].InUse = FALSE;
+    g_FlowContextLookup.Entries[removeIdx].FlowId = 0;
+    g_FlowContextLookup.Entries[removeIdx].Context = NULL;
+    InterlockedDecrement(&g_FlowContextLookup.Count);
+
+    ULONG gapIdx = removeIdx;
+    for (ULONG probe = 1; probe < FLOW_LOOKUP_SIZE; probe++) {
+        ULONG checkIdx = (removeIdx + probe) & FLOW_LOOKUP_MASK;
+        if (!g_FlowContextLookup.Entries[checkIdx].InUse) break;
+
+        ULONG idealIdx = FlowIdHash(g_FlowContextLookup.Entries[checkIdx].FlowId);
+        BOOLEAN needMove = FALSE;
+
+        if (gapIdx <= checkIdx)
+            needMove = (idealIdx <= gapIdx || idealIdx > checkIdx);
+        else
+            needMove = (idealIdx <= gapIdx && idealIdx > checkIdx);
+
+        if (needMove) {
+            g_FlowContextLookup.Entries[gapIdx] = g_FlowContextLookup.Entries[checkIdx];
+            g_FlowContextLookup.Entries[checkIdx].InUse = FALSE;
+            g_FlowContextLookup.Entries[checkIdx].FlowId = 0;
+            g_FlowContextLookup.Entries[checkIdx].Context = NULL;
+            gapIdx = checkIdx;
+        }
+    }
+
+    KeReleaseInStackQueuedSpinLock(&lockHandle);
+}
+
+// ============================================================================
+//  Flow Context 바이트 누적 및 임계값 확인
+// ============================================================================
+
+// 반환: TRUE = 임계값 초과 (차단해야 함), FALSE = 정상
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN UpdateFlowContextAndCheck(
+    _Inout_ PUPLOAD_FLOW_CONTEXT ctx,
+    _In_ ULONG dataLength
+)
+{
+    LARGE_INTEGER currentTime;
+    LONGLONG windowDuration;
+
+    if (ctx == NULL || g_DriverContext == NULL) return FALSE;
+    if (ctx->Blocked) return TRUE;  // 이미 차단된 플로우
+
+    KeQuerySystemTime(&currentTime);
+
+    // 윈도우 만료 확인 → 리셋
+    windowDuration = (currentTime.QuadPart - ctx->WindowStart.QuadPart) / 10000000LL;  // 초 단위
+    if (windowDuration > (LONGLONG)g_DriverContext->UploadWindowSeconds) {
+        ctx->WindowOutboundBytes = 0;
+        ctx->WindowStart = currentTime;
+    }
+
+    // 바이트 누적
+    InterlockedAdd64(&ctx->WindowOutboundBytes, (LONG64)dataLength);
+    InterlockedAdd64(&ctx->OutboundByteCount, (LONG64)dataLength);
+
+    // 임계값 확인
+    if (ctx->WindowOutboundBytes > (LONG64)g_DriverContext->UploadThresholdBytes) {
+        ctx->Blocked = TRUE;
+        InterlockedIncrement64(&g_DriverContext->UploadTotalBlocked);
+
+        KdPrint(("WFP Upload v7.0: THRESHOLD EXCEEDED for app=%s (PID=%lu) - WindowBytes=%lld, Threshold=%lu, SNI=%s\n",
+            ctx->AppName, ctx->ProcessId, ctx->WindowOutboundBytes, g_DriverContext->UploadThresholdBytes,
+            ctx->Sni[0] ? ctx->Sni : "(unknown)"));
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+// ============================================================================
+// ALE Flow Established 콜백 + Flow Delete 콜백
+// ============================================================================
+
+void NTAPI FilterClassifyFlowEstablished(
+    _In_ const FWPS_INCOMING_VALUES0* inFixedValues,
+    _In_ const FWPS_INCOMING_METADATA_VALUES0* inMetaValues,
+    _Inout_opt_ void* layerData,
+    _In_opt_ const void* classifyContext,
+    _In_ const FWPS_FILTER1* filter,
+    _In_ UINT64 flowContext,
+    _Inout_ FWPS_CLASSIFY_OUT0* classifyOut
+)
+{
+    UINT64 flowHandle = 0;
+    CHAR exeName[MAX_APP_NAME_LENGTH];
+    NTSTATUS status;
+    PUPLOAD_FLOW_CONTEXT ctx = NULL;
+    ULONG processId = 0;
+    FWP_BYTE_BLOB* appId = NULL;
+
+    UNREFERENCED_PARAMETER(layerData);
+    UNREFERENCED_PARAMETER(classifyContext);
+    UNREFERENCED_PARAMETER(filter);
+    UNREFERENCED_PARAMETER(flowContext);
+
+    if (classifyOut == NULL) return;
+    classifyOut->actionType = FWP_ACTION_PERMIT;
+
+    if (g_DriverContext == NULL) {
+        return;
+    }
+
+    // 모니터링 앱이면 항상 Flow Context 생성 (활성화 여부와 무관)
+    // → 나중에 UploadBlockingEnabled를 켜도 기존 연결의 트래픽 추적 가능
+    if (g_MonitoredAppList == NULL || g_MonitoredAppList->Count == 0) {
+        return;
+    }
+
+    // App ID 추출 - inFixedValues에서 ALE_APP_ID 필드 사용
+    // (ALE_FLOW_ESTABLISHED 레이어에서는 inMetaValues->processPath가 제공되지 않음!)
+    if (inFixedValues == NULL || inFixedValues->incomingValue == NULL) {
+        return;
+    }
+
+    if (inFixedValues->valueCount > FWPS_FIELD_ALE_FLOW_ESTABLISHED_V4_ALE_APP_ID) {
+        appId = inFixedValues->incomingValue[
+            FWPS_FIELD_ALE_FLOW_ESTABLISHED_V4_ALE_APP_ID].value.byteBlob;
+    }
+
+    if (appId == NULL || appId->data == NULL || appId->size == 0) {
+        return;
+    }
+
+    exeName[0] = '\0';
+    if (!ExtractExeNameFromAppId(appId, exeName, MAX_APP_NAME_LENGTH)) {
+        return;
+    }
+
+    // 모니터링 대상 앱인지 확인
+    if (!IsMonitoredApp(exeName)) {
+        return;  // 대상 앱이 아니면 Context 할당하지 않음
+    }
+
+    // Flow Handle 추출
+    if (inMetaValues == NULL ||
+        !(inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_FLOW_HANDLE)) {
+        return;
+    }
+    flowHandle = inMetaValues->flowHandle;
+
+    // PID 추출
+    if (inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID) {
+        processId = (ULONG)inMetaValues->processId;
+    }
+
+    // Flow Context 할당
+    ctx = (PUPLOAD_FLOW_CONTEXT)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        sizeof(UPLOAD_FLOW_CONTEXT),
+        'FCUW'
+    );
+
+    if (ctx == NULL) {
+        return;
+    }
+
+    RtlZeroMemory(ctx, sizeof(UPLOAD_FLOW_CONTEXT));
+    KeQuerySystemTime(&ctx->CreatedTime);
+    ctx->WindowStart = ctx->CreatedTime;
+    ctx->IsMonitored = TRUE;     // v7.0: 모니터링 앱이면 무조건 추적 (도메인 매칭 불필요)
+    ctx->Blocked = FALSE;
+    ctx->SniChecked = FALSE;
+    ctx->Reserved1 = FALSE;
+    ctx->ProcessId = processId;
+    ctx->FlowId = flowHandle;    // Lookup Table 제거용
+    RtlStringCchCopyA(ctx->AppName, MAX_APP_NAME_LENGTH, exeName);
+
+    // WFP에 Flow Context 연결 (FlowDeleteCallback 트리거용)
+    status = FwpsFlowAssociateContext0(
+        flowHandle,
+        FWPS_LAYER_ALE_FLOW_ESTABLISHED_V4,
+        g_DriverContext->CalloutIdFlow,
+        (UINT64)ctx
+    );
+
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(ctx, 'FCUW');
+        KdPrint(("WFP Flow: FwpsFlowAssociateContext0 failed: 0x%08X\n", status));
+        return;
+    }
+
+    // 교차 레이어 조회용 Lookup Table에 등록
+    // (Stream/QUIC 콜백에서 flowId로 컨텍스트를 찾기 위함)
+    if (!AddFlowContextLookup(flowHandle, ctx)) {
+        // Lookup Table이 가득 참 - 연결은 유지하되 모니터링 불가
+        KdPrint(("WFP Flow: Lookup table full, flow %llu won't be monitored in Stream/QUIC\n", flowHandle));
+    }
+
+    // 카운터 증가
+    InterlockedIncrement(&g_ActiveFlowContextCount);
+    UpdateAppFlowCount(exeName, TRUE);
+
+    KdPrint(("WFP Flow v7.0: Context allocated for %s (PID=%lu, flowId=%llu, monitored=TRUE)\n",
+        exeName, processId, flowHandle));
+}
+
+NTSTATUS NTAPI FilterNotifyFlowEstablished(
+    _In_ FWPS_CALLOUT_NOTIFY_TYPE notifyType,
+    _In_ const GUID* filterKey,
+    _Inout_ FWPS_FILTER1* filter
+)
+{
+    UNREFERENCED_PARAMETER(notifyType);
+    UNREFERENCED_PARAMETER(filterKey);
+    UNREFERENCED_PARAMETER(filter);
+    return STATUS_SUCCESS;
+}
+
+// WFP가 TCP 연결 종료 시 자동 호출 → Flow Context 메모리 해제
+void NTAPI FlowDeleteCallback(
+    _In_ UINT16 layerId,
+    _In_ UINT32 calloutId,
+    _In_ UINT64 flowContext
+)
+{
+    PUPLOAD_FLOW_CONTEXT ctx = (PUPLOAD_FLOW_CONTEXT)flowContext;
+
+    UNREFERENCED_PARAMETER(layerId);
+    UNREFERENCED_PARAMETER(calloutId);
+
+    if (ctx == NULL) return;
+
+    // Lookup Table에서 제거 (Stream/QUIC 콜백에서 더 이상 조회되지 않도록)
+    RemoveFlowContextLookup(ctx->FlowId);
+
+    // 카운터 감소
+    InterlockedDecrement(&g_ActiveFlowContextCount);
+    if (ctx->AppName[0] != '\0') {
+        UpdateAppFlowCount(ctx->AppName, FALSE);
+    }
+
+    KdPrint(("WFP Flow: Context freed for %s (app=%s, total=%lld bytes, monitored=%d)\n",
+        ctx->Sni[0] ? ctx->Sni : "(no-sni)",
+        ctx->AppName,
+        ctx->OutboundByteCount,
+        ctx->IsMonitored));
+
+    ExFreePoolWithTag(ctx, 'FCUW');
 }
 
 // ============================================================================
@@ -1321,6 +2108,10 @@ void ParseDnsResponseForBlocking(
                     (ipAddress >> 24) & 0xFF, (ipAddress >> 16) & 0xFF,
                     (ipAddress >> 8) & 0xFF, ipAddress & 0xFF, domainName));
             }
+
+            // 업로드 모니터링 도메인은 IP를 차단 캐시에 추가하지 않음
+            // 크기 기반 차단에서는 연결을 허용하고 아웃바운드 크기만 추적함
+            // (기존의 SNI 차단 도메인만 IP 캐시에 추가)
         }
 
         offset += rdLength;
@@ -1554,6 +2345,8 @@ BOOLEAN ModifyDnsResponseForSinkhole(
         // A 레코드 (IPv4) 이고 차단 대상 도메인인 경우 IP 수정
         if (rrType == 1 && rdLength == 4) {
             if (domainName[0] != '\0' && IsSniInBlockList(domainName)) {
+                // v5.0: 업로드 모니터링 도메인은 DNS 싱크홀 대상에서 제외
+                // 크기 기반 차단에서는 정상 DNS 응답을 허용해야 연결 후 크기 추적 가능
                 // 기존 IP 로깅
                 ULONG originalIp = ((ULONG)data[offset] << 24) |
                     ((ULONG)data[offset + 1] << 16) |
@@ -1838,6 +2631,111 @@ void NTAPI FilterClassifyConnect(
 }
 
 // ============================================================================
+// v5.2: 지연 생성(Lazy Creation) - Stream/QUIC 콜백에서 Flow Context 생성
+// ALE_FLOW_ESTABLISHED에서 놓친 연결(업로드 차단 활성화 전 기존 연결)에 대해
+// Stream/QUIC 데이터 도착 시 Flow Context를 뒤늦게 생성
+// ============================================================================
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PUPLOAD_FLOW_CONTEXT CreateLazyFlowContext(
+    _In_ const FWPS_INCOMING_METADATA_VALUES0 * inMetaValues
+)
+{
+    PUPLOAD_FLOW_CONTEXT ctx = NULL;
+    UINT64 flowHandle = 0;
+    ULONG processId = 0;
+    CHAR exeName[MAX_APP_NAME_LENGTH];
+    NTSTATUS status;
+
+    if (g_DriverContext == NULL || inMetaValues == NULL) return NULL;
+    if (g_MonitoredAppList == NULL || g_MonitoredAppList->Count == 0) return NULL;
+
+    // Flow Handle 필수
+    if (!(inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_FLOW_HANDLE)) return NULL;
+    flowHandle = inMetaValues->flowHandle;
+
+    // 이중 확인: 이미 존재하면 반환
+    ctx = FindFlowContextByFlowId(flowHandle);
+    if (ctx != NULL) return ctx;
+
+    // processPath에서 exe 이름 추출
+    if (!(inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_PATH) ||
+        inMetaValues->processPath == NULL) {
+        return NULL;
+    }
+
+    exeName[0] = '\0';
+    if (!ExtractExeNameFromAppId(inMetaValues->processPath, exeName, MAX_APP_NAME_LENGTH)) {
+        return NULL;
+    }
+
+    // 모니터링 대상 앱인지 확인
+    if (!IsMonitoredApp(exeName)) return NULL;
+
+    // PID 추출
+    if (inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID) {
+        processId = (ULONG)inMetaValues->processId;
+    }
+
+    // Flow Context 할당
+    ctx = (PUPLOAD_FLOW_CONTEXT)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        sizeof(UPLOAD_FLOW_CONTEXT),
+        'FCUW'
+    );
+    if (ctx == NULL) return NULL;
+
+    RtlZeroMemory(ctx, sizeof(UPLOAD_FLOW_CONTEXT));
+    KeQuerySystemTime(&ctx->CreatedTime);
+    ctx->WindowStart = ctx->CreatedTime;
+    ctx->IsMonitored = TRUE;     // v7.0: 모니터링 앱이면 무조건 추적
+    ctx->Blocked = FALSE;
+    ctx->SniChecked = FALSE;
+    ctx->Reserved1 = FALSE;
+    ctx->ProcessId = processId;
+    ctx->FlowId = flowHandle;
+    RtlStringCchCopyA(ctx->AppName, MAX_APP_NAME_LENGTH, exeName);
+
+    // WFP에 Flow Context 연결
+    status = FwpsFlowAssociateContext0(
+        flowHandle,
+        FWPS_LAYER_ALE_FLOW_ESTABLISHED_V4,
+        g_DriverContext->CalloutIdFlow,
+        (UINT64)ctx
+    );
+
+    if (!NT_SUCCESS(status)) {
+        // v5.3 FIX: WFP 연결 실패해도 Lookup Table에는 등록
+        // 드라이버 로드 전에 이미 수립된 TCP 연결(예: 카카오톡 persistent connection)은
+        // ALE_FLOW_ESTABLISHED 콜아웃의 추적 테이블에 없어서 Associate가 실패함.
+        // 그러나 바이트 카운팅은 Lookup Table만 있으면 동작하므로, 등록 계속 진행.
+        // 주의: FlowDeleteCallback이 호출되지 않으므로 연결 종료 시 자동 정리 안 됨.
+        //       컨텍스트는 드라이버 언로드 시 일괄 정리.
+        KdPrint(("WFP Lazy: FwpsFlowAssociateContext0 failed: 0x%08X (flowId=%llu) - continuing without WFP association\n",
+            status, flowHandle));
+    }
+
+    // Lookup Table에 등록 (WFP 연결 성공/실패 무관하게 바이트 추적용)
+    if (!AddFlowContextLookup(flowHandle, ctx)) {
+        // Lookup Table 포화 - 추적 불가
+        KdPrint(("WFP Lazy: Lookup table full for flow %llu\n", flowHandle));
+        if (!NT_SUCCESS(status)) {
+            // WFP 연결도 실패, Lookup도 실패 → 이 컨텍스트는 쓸 수 없음
+            ExFreePoolWithTag(ctx, 'FCUW');
+            return NULL;
+        }
+    }
+
+    InterlockedIncrement(&g_ActiveFlowContextCount);
+    UpdateAppFlowCount(exeName, TRUE);
+
+    KdPrint(("WFP Lazy: Flow context created for %s (PID=%lu, flowId=%llu)\n",
+        exeName, processId, flowHandle));
+
+    return ctx;
+}
+
+// ============================================================================
 // SNI Stream Classify 콜백 
 // ============================================================================
 
@@ -1870,7 +2768,9 @@ void NTAPI FilterClassifyStream(
     }
     classifyOut->actionType = FWP_ACTION_PERMIT;
 
-    if (g_DriverContext == NULL || g_DriverContext->SniBlockingEnabled == 0) {
+    if (g_DriverContext == NULL ||
+        (g_DriverContext->SniBlockingEnabled == 0 && g_DriverContext->UploadBlockingEnabled == 0 &&
+            g_DriverContext->CaptureEnabled == 0)) {
         return;
     }
 
@@ -1921,7 +2821,43 @@ void NTAPI FilterClassifyStream(
         return;
     }
 
-    // 데이터 버퍼 처리
+    // ========================================================================
+    // v5.2: Flow Context 기반 업로드 추적 (지연 생성 지원)
+    // ALE_FLOW_ESTABLISHED에서 놓친 플로우도 여기서 Context 생성
+    // ========================================================================
+    if (g_DriverContext->UploadBlockingEnabled && remoteIp != 0 &&
+        inMetaValues != NULL &&
+        (inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_FLOW_HANDLE)) {
+
+        PUPLOAD_FLOW_CONTEXT ctx = FindFlowContextByFlowId(inMetaValues->flowHandle);
+
+        // v5.2: 기존 컨텍스트가 없으면 지연 생성 시도
+        // (업로드 차단 활성화 전에 이미 연결된 플로우 대응)
+        if (ctx == NULL) {
+            ctx = CreateLazyFlowContext(inMetaValues);
+        }
+
+        if (ctx != NULL) {
+            // Fast path 최적화:
+            // - 비모니터링 (ctx->IsMonitored=FALSE): 해시 조회 1회 + 조건 검사 → 즉시 탈출
+            // - Blocked: UpdateFlowContextAndCheck에서 즉시 TRUE 반환
+            // - 정상 추적: atomic add + 정수 비교 (스핀락 없음)
+            if (ctx->IsMonitored) {
+                ULONG totalStreamBytes = (ULONG)streamData->dataLength;
+                if (UpdateFlowContextAndCheck(ctx, totalStreamBytes)) {
+                    shouldBlock = TRUE;
+                    KdPrint(("WFP Stream v5.2: UPLOAD EXCEEDED for %s (app=%s), blocking\n",
+                        ctx->Sni[0] ? ctx->Sni : "(unknown)", ctx->AppName));
+                }
+
+                if (shouldBlock) {
+                    goto do_block_check;
+                }
+            }
+        }
+    }
+
+    // 데이터 버퍼 처리 (TLS ClientHello 검사)
     if (streamData->netBufferListChain != NULL) {
         NET_BUFFER_LIST* nbl = streamData->netBufferListChain;
         NET_BUFFER* nb = NET_BUFFER_LIST_FIRST_NB(nbl);
@@ -1954,6 +2890,25 @@ void NTAPI FilterClassifyStream(
                                         AddBlockedIp(remoteIp, sniBuffer);
                                     }
                                 }
+
+                                // v7.0: Flow Context에 SNI 기록 (도메인 매칭 없이 로그용)
+                                if (!shouldBlock && g_DriverContext->UploadBlockingEnabled &&
+                                    inMetaValues != NULL &&
+                                    (inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_FLOW_HANDLE)) {
+
+                                    PUPLOAD_FLOW_CONTEXT ctx = FindFlowContextByFlowId(inMetaValues->flowHandle);
+
+                                    if (ctx == NULL) {
+                                        ctx = CreateLazyFlowContext(inMetaValues);
+                                    }
+
+                                    if (ctx != NULL && !ctx->SniChecked) {
+                                        ctx->SniChecked = TRUE;
+                                        RtlStringCchCopyA(ctx->Sni, MAX_SNI_LENGTH, sniBuffer);
+                                        KdPrint(("WFP Stream v7.0: SNI recorded for %s (app=%s)\n",
+                                            sniBuffer, ctx->AppName));
+                                    }
+                                }
                             }
                         }
                     }
@@ -1964,6 +2919,7 @@ void NTAPI FilterClassifyStream(
         }
     }
 
+do_block_check:
     // 차단 처리 - 즉시 연결 끊기
     if (shouldBlock) {
         classifyOut->actionType = FWP_ACTION_BLOCK;
@@ -1985,12 +2941,30 @@ void NTAPI FilterClassifyStream(
             packetInfo.Protocol = PROTO_TCP;
             packetInfo.Direction = PACKET_DIR_OUTBOUND;
             packetInfo.Action = PACKET_ACTION_BLOCK;
+            packetInfo.PacketSize = (streamData != NULL) ? (ULONG)streamData->dataLength : 0;
 
             EnqueuePacket(&packetInfo);
             InterlockedIncrement64(&g_DriverContext->TotalCaptured);
         }
 
         InterlockedIncrement64(&g_DriverContext->TotalBlocked);
+    }
+    // 캡처 활성화 시: 차단되지 않은 스트림 데이터도 기록 (실제 패킷 크기 포함)
+    else if (g_DriverContext->CaptureEnabled && streamData != NULL && streamData->dataLength > 0) {
+        PACKET_INFO packetInfo = { 0 };
+        packetInfo.Timestamp = GetCurrentTimestamp();
+        packetInfo.ProcessId = (ULONG)processPid;
+        packetInfo.LocalAddress = localIp;
+        packetInfo.RemoteAddress = remoteIp;
+        packetInfo.LocalPort = localPort;
+        packetInfo.RemotePort = remotePort;
+        packetInfo.Protocol = PROTO_TCP;
+        packetInfo.Direction = PACKET_DIR_OUTBOUND;
+        packetInfo.Action = PACKET_ACTION_PERMIT;
+        packetInfo.PacketSize = (ULONG)streamData->dataLength;
+
+        EnqueuePacket(&packetInfo);
+        InterlockedIncrement64(&g_DriverContext->TotalCaptured);
     }
 }
 
@@ -2015,6 +2989,7 @@ void NTAPI FilterClassifyQuic(
     BOOLEAN shouldBlock = FALSE;
     CHAR sniBuffer[MAX_SNI_LENGTH];
     UINT64 processPid = 0;
+    ULONG quicPacketSize = 0;   // 차단 패킷 로그용 크기 추적
 
     UNREFERENCED_PARAMETER(classifyContext);
     UNREFERENCED_PARAMETER(filter);
@@ -2025,9 +3000,21 @@ void NTAPI FilterClassifyQuic(
     }
     classifyOut->actionType = FWP_ACTION_PERMIT;
 
-    if (g_DriverContext == NULL ||
-        g_DriverContext->SniBlockingEnabled == 0 ||
-        g_DriverContext->QuicBlockingEnabled == 0) {
+    // v5.3 BUG FIX: Stream callback uses AND (both off → exit),
+    // but QUIC callback was using OR (either off → exit).
+    // This caused upload tracking to be skipped for QUIC/HTTP3 connections
+    // (e.g., Chrome/Edge connecting to Naver via QUIC).
+    // Now: exit only if ALL relevant features are disabled.
+    BOOLEAN sniQuicEnabled = (g_DriverContext != NULL &&
+        g_DriverContext->SniBlockingEnabled != 0 &&
+        g_DriverContext->QuicBlockingEnabled != 0);
+    BOOLEAN uploadEnabled = (g_DriverContext != NULL &&
+        g_DriverContext->UploadBlockingEnabled != 0);
+
+    BOOLEAN captureEnabled = (g_DriverContext != NULL &&
+        g_DriverContext->CaptureEnabled != 0);
+
+    if (g_DriverContext == NULL || (!sniQuicEnabled && !uploadEnabled && !captureEnabled)) {
         return;
     }
 
@@ -2069,10 +3056,71 @@ void NTAPI FilterClassifyQuic(
         return;
     }
 
-    // 먼저 IP 캐시 확인 (버그 수정: IsIpBlockedWithSniIncrement 사용)
-    if (IsIpBlockedWithSniIncrement(remoteAddress)) {
+    // ========================================================================
+    // v5.3 BUG FIX: Upload byte tracking BEFORE SNI blocking check
+    // Previously, upload tracking was inside the SNI blocking code path,
+    // so it was skipped when SNI/QUIC blocking was disabled.
+    // Now upload tracking runs independently, matching FilterClassifyStream.
+    // ========================================================================
+    if (uploadEnabled && layerData != NULL) {
+        ULONG direction = FWP_DIRECTION_OUTBOUND;
+        if (inFixedValues->valueCount > FWPS_FIELD_DATAGRAM_DATA_V4_DIRECTION) {
+            direction = inFixedValues->incomingValue[
+                FWPS_FIELD_DATAGRAM_DATA_V4_DIRECTION].value.uint32;
+        }
+
+        if (direction == FWP_DIRECTION_OUTBOUND &&
+            inMetaValues != NULL &&
+            (inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_FLOW_HANDLE)) {
+
+            PUPLOAD_FLOW_CONTEXT ctx = FindFlowContextByFlowId(inMetaValues->flowHandle);
+
+            if (ctx == NULL) {
+                ctx = CreateLazyFlowContext(inMetaValues);
+            }
+
+            if (ctx != NULL) {
+                if (ctx->IsMonitored) {
+                    NET_BUFFER_LIST* tmpNbl = (NET_BUFFER_LIST*)layerData;
+                    ULONG quicDataLen = 0;
+                    if (tmpNbl != NULL) {
+                        NET_BUFFER* tmpNb = NET_BUFFER_LIST_FIRST_NB(tmpNbl);
+                        if (tmpNb != NULL) {
+                            quicDataLen = NET_BUFFER_DATA_LENGTH(tmpNb);
+                            quicPacketSize = quicDataLen;  // 패킷 크기 추적
+                        }
+                    }
+
+                    if (quicDataLen > 0 && UpdateFlowContextAndCheck(ctx, quicDataLen)) {
+                        shouldBlock = TRUE;
+                        KdPrint(("WFP QUIC v5.3: UPLOAD EXCEEDED for %s (app=%s), blocking\n",
+                            ctx->Sni, ctx->AppName));
+                    }
+                }
+            }
+
+            if (shouldBlock) {
+                goto quic_block_check;
+            }
+        }
+    }
+
+    // 먼저 IP 캐시 확인 (SNI/QUIC 차단이 활성화된 경우에만)
+    if (sniQuicEnabled && IsIpBlockedWithSniIncrement(remoteAddress)) {
         shouldBlock = TRUE;
         InterlockedIncrement64(&g_DriverContext->QuicTotalBlocked);
+
+        // 패킷 크기 추출 (차단 로그용)
+        if (layerData != NULL) {
+            NET_BUFFER_LIST* tmpNbl = (NET_BUFFER_LIST*)layerData;
+            if (tmpNbl != NULL) {
+                NET_BUFFER* tmpNb = NET_BUFFER_LIST_FIRST_NB(tmpNbl);
+                if (tmpNb != NULL) {
+                    quicPacketSize = NET_BUFFER_DATA_LENGTH(tmpNb);
+                }
+            }
+        }
+
         KdPrint(("WFP QUIC: Blocking cached IP %u.%u.%u.%u:443\n",
             (remoteAddress >> 24) & 0xFF,
             (remoteAddress >> 16) & 0xFF,
@@ -2080,57 +3128,71 @@ void NTAPI FilterClassifyQuic(
             remoteAddress & 0xFF));
     }
 
-    // QUIC Initial 패킷에서 SNI 파싱 시도
-    if (!shouldBlock && layerData != NULL) {
-        FWPS_STREAM_CALLOUT_IO_PACKET0* packet = (FWPS_STREAM_CALLOUT_IO_PACKET0*)layerData;
+    // v5.3: QUIC Initial 패킷에서 SNI 파싱 시도
+    // SNI 차단 또는 업로드 모니터링 중 하나라도 활성화되어 있으면 SNI 추출 필요
+    if (!shouldBlock && (sniQuicEnabled || uploadEnabled) && layerData != NULL) {
 
         // DATAGRAM_DATA에서는 NET_BUFFER_LIST 직접 접근
         if (inMetaValues != NULL) {
-            NET_BUFFER_LIST* nbl = NULL;
+            NET_BUFFER_LIST* nbl = (NET_BUFFER_LIST*)layerData;
 
-            // 다양한 방법으로 데이터 접근 시도
-            // (DATAGRAM_DATA 레이어의 layerData 형식에 따라 다름)
-            if (packet != NULL) {
-                // 직접 NET_BUFFER_LIST 캐스트 시도
-                nbl = (NET_BUFFER_LIST*)layerData;
+            if (nbl != NULL) {
+                NET_BUFFER* nb = NET_BUFFER_LIST_FIRST_NB(nbl);
 
-                if (nbl != NULL) {
-                    NET_BUFFER* nb = NET_BUFFER_LIST_FIRST_NB(nbl);
+                if (nb != NULL) {
+                    ULONG dataLength = NET_BUFFER_DATA_LENGTH(nb);
+                    quicPacketSize = dataLength;  // 패킷 크기 추적
 
-                    if (nb != NULL) {
-                        ULONG dataLength = NET_BUFFER_DATA_LENGTH(nb);
+                    if (dataLength >= 20 && dataLength < 4096) {
+                        UCHAR* dataBuffer = (UCHAR*)ExAllocatePool2(
+                            POOL_FLAG_NON_PAGED,
+                            dataLength,
+                            'QUIB'
+                        );
 
-                        if (dataLength >= 20 && dataLength < 4096) {
-                            UCHAR* dataBuffer = (UCHAR*)ExAllocatePool2(
-                                POOL_FLAG_NON_PAGED,
-                                dataLength,
-                                'QUIB'
-                            );
+                        if (dataBuffer != NULL) {
+                            UCHAR* mappedData = (UCHAR*)NdisGetDataBuffer(
+                                nb, dataLength, dataBuffer, 1, 0);
 
-                            if (dataBuffer != NULL) {
-                                UCHAR* mappedData = (UCHAR*)NdisGetDataBuffer(
-                                    nb, dataLength, dataBuffer, 1, 0);
+                            if (mappedData != NULL) {
+                                sniBuffer[0] = '\0';
 
-                                if (mappedData != NULL) {
-                                    sniBuffer[0] = '\0';
+                                if (ExtractSniFromQuicInitial(mappedData, dataLength,
+                                    sniBuffer, MAX_SNI_LENGTH)) {
 
-                                    if (ExtractSniFromQuicInitial(mappedData, dataLength,
-                                        sniBuffer, MAX_SNI_LENGTH)) {
-                                        if (IsSniBlocked(sniBuffer)) {
-                                            shouldBlock = TRUE;
-                                            InterlockedIncrement64(&g_DriverContext->QuicTotalBlocked);
+                                    // SNI 차단 확인 (SNI/QUIC 차단이 활성화된 경우에만)
+                                    if (sniQuicEnabled && IsSniBlocked(sniBuffer)) {
+                                        shouldBlock = TRUE;
+                                        InterlockedIncrement64(&g_DriverContext->QuicTotalBlocked);
 
-                                            // IP 캐시에 추가
-                                            AddBlockedIp(remoteAddress, sniBuffer);
+                                        // IP 캐시에 추가
+                                        AddBlockedIp(remoteAddress, sniBuffer);
 
-                                            KdPrint(("WFP QUIC: Blocking Initial to %s (IP added to cache)\n",
-                                                sniBuffer));
+                                        KdPrint(("WFP QUIC: Blocking Initial to %s (IP added to cache)\n",
+                                            sniBuffer));
+                                    }
+
+                                    // v7.0: Flow Context에 SNI 기록 (도메인 매칭 없이 로그용)
+                                    if (!shouldBlock && uploadEnabled &&
+                                        (inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_FLOW_HANDLE)) {
+
+                                        PUPLOAD_FLOW_CONTEXT ctx = FindFlowContextByFlowId(inMetaValues->flowHandle);
+
+                                        if (ctx == NULL) {
+                                            ctx = CreateLazyFlowContext(inMetaValues);
+                                        }
+
+                                        if (ctx != NULL && !ctx->SniChecked) {
+                                            ctx->SniChecked = TRUE;
+                                            RtlStringCchCopyA(ctx->Sni, MAX_SNI_LENGTH, sniBuffer);
+                                            KdPrint(("WFP QUIC v7.0: SNI recorded for %s (app=%s)\n",
+                                                sniBuffer, ctx->AppName));
                                         }
                                     }
                                 }
-
-                                ExFreePoolWithTag(dataBuffer, 'QUIB');
                             }
+
+                            ExFreePoolWithTag(dataBuffer, 'QUIB');
                         }
                     }
                 }
@@ -2138,11 +3200,12 @@ void NTAPI FilterClassifyQuic(
         }
     }
 
+quic_block_check:
     if (shouldBlock) {
         classifyOut->actionType = FWP_ACTION_BLOCK;
         classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
 
-        // 버그 수정: 차단된 패킷 정보를 큐에 추가하여 UI에 표시
+        // 차단된 패킷 정보를 큐에 추가하여 UI에 표시
         {
             PACKET_INFO packetInfo = { 0 };
             packetInfo.Timestamp = GetCurrentTimestamp();
@@ -2154,12 +3217,39 @@ void NTAPI FilterClassifyQuic(
             packetInfo.Protocol = PROTO_UDP;
             packetInfo.Direction = PACKET_DIR_OUTBOUND;
             packetInfo.Action = PACKET_ACTION_BLOCK;
+            packetInfo.PacketSize = quicPacketSize;
 
             EnqueuePacket(&packetInfo);
             InterlockedIncrement64(&g_DriverContext->TotalCaptured);
         }
 
         InterlockedIncrement64(&g_DriverContext->TotalBlocked);
+    }
+    // 캡처 활성화 시: 차단되지 않은 QUIC 데이터도 기록 (실제 패킷 크기 포함)
+    else if (g_DriverContext->CaptureEnabled && quicPacketSize > 0 && layerData != NULL) {
+        ULONG direction = FWP_DIRECTION_OUTBOUND;
+        if (inFixedValues != NULL && inFixedValues->incomingValue != NULL &&
+            inFixedValues->valueCount > FWPS_FIELD_DATAGRAM_DATA_V4_DIRECTION) {
+            direction = inFixedValues->incomingValue[
+                FWPS_FIELD_DATAGRAM_DATA_V4_DIRECTION].value.uint32;
+        }
+
+        if (direction == FWP_DIRECTION_OUTBOUND) {
+            PACKET_INFO packetInfo = { 0 };
+            packetInfo.Timestamp = GetCurrentTimestamp();
+            packetInfo.ProcessId = (ULONG)processPid;
+            packetInfo.LocalAddress = localAddress;
+            packetInfo.RemoteAddress = remoteAddress;
+            packetInfo.LocalPort = localPort;
+            packetInfo.RemotePort = remotePort;
+            packetInfo.Protocol = PROTO_UDP;
+            packetInfo.Direction = PACKET_DIR_OUTBOUND;
+            packetInfo.Action = PACKET_ACTION_PERMIT;
+            packetInfo.PacketSize = quicPacketSize;
+
+            EnqueuePacket(&packetInfo);
+            InterlockedIncrement64(&g_DriverContext->TotalCaptured);
+        }
     }
 }
 
@@ -2603,6 +3693,67 @@ SkipQuic:
     KdPrint(("WFP: DNS monitor filter registered\n"));
 
 SkipDns:
+
+    // ========================================================================
+    // 5. v5.0: ALE Flow Established Callout (업로드 DLP Flow Context용)
+    // ========================================================================
+
+    RtlZeroMemory(&mCallout, sizeof(mCallout));
+    RtlZeroMemory(&sCallout, sizeof(sCallout));
+    RtlZeroMemory(&filter, sizeof(filter));
+
+    mCallout.calloutKey = GUID_MY_WFP_FLOW_CALLOUT;
+    mCallout.displayData.name = L"WFP Flow Established Callout";
+    mCallout.displayData.description = L"Monitors flow establishment for upload DLP with App ID filtering";
+    mCallout.applicableLayer = FWPM_LAYER_ALE_FLOW_ESTABLISHED_V4;
+    // v5.2 수정: FWP_CALLOUT_FLAG_CONDITIONAL_ON_FLOW은 FWPS_CALLOUT용 플래그임
+    // FWPM_CALLOUT0에 설정하면 모든 플로우에서 콜백이 호출되지 않을 수 있음
+    mCallout.flags = 0;
+
+    status = FwpmCalloutAdd0(g_DriverContext->EngineHandle, &mCallout, NULL, NULL);
+    if (!NT_SUCCESS(status)) {
+        KdPrint(("WFP: FwpmCalloutAdd0 (Flow) failed: 0x%08X\n", status));
+        goto SkipFlow;
+    }
+
+    sCallout.calloutKey = GUID_MY_WFP_FLOW_CALLOUT;
+    sCallout.classifyFn = (FWPS_CALLOUT_CLASSIFY_FN1)FilterClassifyFlowEstablished;
+    sCallout.notifyFn = (FWPS_CALLOUT_NOTIFY_FN1)FilterNotifyFlowEstablished;
+    sCallout.flowDeleteFn = FlowDeleteCallback;  // 핵심: 플로우 종료 시 자동 정리
+
+    status = FwpsCalloutRegister1(pDeviceObj, &sCallout, &g_DriverContext->CalloutIdFlow);
+    if (!NT_SUCCESS(status)) {
+        KdPrint(("WFP: FwpsCalloutRegister1 (Flow) failed: 0x%08X\n", status));
+        goto SkipFlow;
+    }
+
+    filter.displayData.name = L"WFP Flow Established Filter";
+    filter.displayData.description = L"Filter for flow-level upload DLP monitoring";
+    filter.layerKey = FWPM_LAYER_ALE_FLOW_ESTABLISHED_V4;
+    filter.action.type = FWP_ACTION_CALLOUT_INSPECTION;  // 검사 전용 (차단 안 함)
+    filter.action.calloutKey = GUID_MY_WFP_FLOW_CALLOUT;
+    filter.weight.type = FWP_UINT8;
+    filter.weight.uint8 = 0x05;
+
+    status = FwpmFilterAdd0(
+        g_DriverContext->EngineHandle,
+        &filter,
+        NULL,
+        &g_DriverContext->FilterIdFlow
+    );
+
+    if (!NT_SUCCESS(status)) {
+        KdPrint(("WFP: FwpmFilterAdd0 (Flow) failed: 0x%08X\n", status));
+        if (g_DriverContext->CalloutIdFlow != 0) {
+            FwpsCalloutUnregisterById0(g_DriverContext->CalloutIdFlow);
+            g_DriverContext->CalloutIdFlow = 0;
+        }
+        goto SkipFlow;
+    }
+
+    KdPrint(("WFP: ALE Flow Established filter registered (v5.0 upload DLP)\n"));
+
+SkipFlow:
     KdPrint(("WFP: All filter registration completed\n"));
     return STATUS_SUCCESS;
 }
@@ -2616,6 +3767,16 @@ void UnregisterWfpFilter(void)
     }
 
     if (g_DriverContext->EngineHandle != NULL) {
+        // v5.0: Flow Established 필터 제거 (먼저 제거해야 FlowDeleteCallback이 정상 동작)
+        if (g_DriverContext->FilterIdFlow != 0) {
+            FwpmFilterDeleteById0(g_DriverContext->EngineHandle, g_DriverContext->FilterIdFlow);
+            g_DriverContext->FilterIdFlow = 0;
+        }
+        if (g_DriverContext->CalloutIdFlow != 0) {
+            FwpsCalloutUnregisterById0(g_DriverContext->CalloutIdFlow);
+            g_DriverContext->CalloutIdFlow = 0;
+        }
+
         // DNS 필터 제거
         if (g_DriverContext->FilterIdDns != 0) {
             FwpmFilterDeleteById0(g_DriverContext->EngineHandle, g_DriverContext->FilterIdDns);
@@ -2994,6 +4155,186 @@ NTSTATUS DispatchDeviceControl(
         break;
     }
 
+    // ========================================================================
+    // SNS 파일 업로드 DLP IOCTL (v5.0 Flow Context + App ID)
+    // ========================================================================
+    // v7.0: 도메인 기반 IOCTL 제거 (UPLOAD_BLOCK_URL, UPLOAD_GET_BLOCK_LIST, UPLOAD_CLEAR_BLOCK_LIST, UPLOAD_ADD_PRESET)
+    // 앱 기반 DLP만 유지
+
+    case IOCTL_WFP_UPLOAD_TOGGLE_BLOCKING:
+    {
+        PUPLOAD_TOGGLE pToggle = (PUPLOAD_TOGGLE)inputBuffer;
+
+        if (pToggle == NULL || inputLength < sizeof(UPLOAD_TOGGLE)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        g_DriverContext->UploadBlockingEnabled = pToggle->Enable;
+        KdPrint(("WFP Upload: Blocking %s\n", pToggle->Enable ? "enabled" : "disabled"));
+        break;
+    }
+
+    // v7.0: IOCTL_WFP_UPLOAD_ADD_PRESET 제거 (도메인 프리셋 불필요)
+
+    case IOCTL_WFP_UPLOAD_GET_STATUS:
+    {
+        PUPLOAD_BLOCK_STATUS pStatus = (PUPLOAD_BLOCK_STATUS)outputBuffer;
+
+        if (pStatus == NULL || outputLength < sizeof(UPLOAD_BLOCK_STATUS)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        RtlZeroMemory(pStatus, sizeof(UPLOAD_BLOCK_STATUS));
+        pStatus->Enabled = g_DriverContext->UploadBlockingEnabled;
+        pStatus->Reserved1 = 0;
+        pStatus->TotalBlocked = (ULONGLONG)g_DriverContext->UploadTotalBlocked;
+        pStatus->ThresholdBytes = g_DriverContext->UploadThresholdBytes;
+        pStatus->WindowSeconds = g_DriverContext->UploadWindowSeconds;
+        pStatus->ActiveFlows = (ULONG)g_ActiveFlowContextCount;
+        pStatus->MonitoredApps = g_MonitoredAppList ? (ULONG)g_MonitoredAppList->Count : 0;
+
+        information = sizeof(UPLOAD_BLOCK_STATUS);
+        break;
+    }
+
+    case IOCTL_WFP_UPLOAD_SET_THRESHOLD:
+    {
+        PUPLOAD_THRESHOLD_CONFIG pConfig = (PUPLOAD_THRESHOLD_CONFIG)inputBuffer;
+
+        if (pConfig == NULL || inputLength < sizeof(UPLOAD_THRESHOLD_CONFIG)) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        if (pConfig->ThresholdBytes > 0) {
+            g_DriverContext->UploadThresholdBytes = pConfig->ThresholdBytes;
+        }
+        if (pConfig->WindowSeconds > 0) {
+            g_DriverContext->UploadWindowSeconds = pConfig->WindowSeconds;
+        }
+
+        KdPrint(("WFP Upload: Threshold set to %lu bytes, window %lu sec\n",
+            g_DriverContext->UploadThresholdBytes, g_DriverContext->UploadWindowSeconds));
+        break;
+    }
+
+    // ========================================================================
+    // v5.0: 모니터링 대상 앱 관리 IOCTL
+    // ========================================================================
+
+    case IOCTL_WFP_UPLOAD_ADD_APP:
+    {
+        PMONITORED_APP_REQUEST pReq = (PMONITORED_APP_REQUEST)inputBuffer;
+        PMONITORED_APP_RESPONSE pResp = (PMONITORED_APP_RESPONSE)outputBuffer;
+
+        if (pReq == NULL || inputLength < sizeof(MONITORED_APP_REQUEST)) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        pReq->AppName[MAX_APP_NAME_LENGTH - 1] = '\0';
+        BOOLEAN success = AddMonitoredApp(pReq->AppName);
+
+        if (pResp != NULL && outputLength >= sizeof(MONITORED_APP_RESPONSE)) {
+            RtlZeroMemory(pResp, sizeof(MONITORED_APP_RESPONSE));
+            pResp->Success = success ? 1 : 0;
+            pResp->TotalApps = g_MonitoredAppList ? (ULONG)g_MonitoredAppList->Count : 0;
+            information = sizeof(MONITORED_APP_RESPONSE);
+        }
+        break;
+    }
+
+    case IOCTL_WFP_UPLOAD_REMOVE_APP:
+    {
+        PMONITORED_APP_REQUEST pReq = (PMONITORED_APP_REQUEST)inputBuffer;
+        PMONITORED_APP_RESPONSE pResp = (PMONITORED_APP_RESPONSE)outputBuffer;
+
+        if (pReq == NULL || inputLength < sizeof(MONITORED_APP_REQUEST)) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        pReq->AppName[MAX_APP_NAME_LENGTH - 1] = '\0';
+        BOOLEAN success = RemoveMonitoredApp(pReq->AppName);
+
+        if (pResp != NULL && outputLength >= sizeof(MONITORED_APP_RESPONSE)) {
+            RtlZeroMemory(pResp, sizeof(MONITORED_APP_RESPONSE));
+            pResp->Success = success ? 1 : 0;
+            pResp->TotalApps = g_MonitoredAppList ? (ULONG)g_MonitoredAppList->Count : 0;
+            information = sizeof(MONITORED_APP_RESPONSE);
+        }
+        break;
+    }
+
+    case IOCTL_WFP_UPLOAD_GET_APP_LIST:
+    {
+        PMONITORED_APP_LIST_RESPONSE pList = (PMONITORED_APP_LIST_RESPONSE)outputBuffer;
+
+        if (pList == NULL || outputLength < sizeof(MONITORED_APP_LIST_RESPONSE)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        RtlZeroMemory(pList, sizeof(MONITORED_APP_LIST_RESPONSE));
+
+        if (g_MonitoredAppList != NULL) {
+            KLOCK_QUEUE_HANDLE lockHandle;
+            KeAcquireInStackQueuedSpinLock(&g_MonitoredAppList->Lock, &lockHandle);
+
+            pList->TotalCount = (ULONG)g_MonitoredAppList->Count;
+            ULONG returnedCount = 0;
+
+            for (LONG i = 0; i < MAX_MONITORED_APPS && returnedCount < MAX_MONITORED_APPS; i++) {
+                if (g_MonitoredAppList->Entries[i].InUse) {
+                    RtlStringCchCopyA(
+                        pList->Entries[returnedCount].AppName,
+                        MAX_APP_NAME_LENGTH,
+                        g_MonitoredAppList->Entries[i].AppName
+                    );
+                    pList->Entries[returnedCount].ActiveFlows =
+                        (ULONG)g_MonitoredAppList->Entries[i].ActiveFlows;
+                    returnedCount++;
+                }
+            }
+
+            pList->ReturnedCount = returnedCount;
+            KeReleaseInStackQueuedSpinLock(&lockHandle);
+        }
+
+        information = sizeof(MONITORED_APP_LIST_RESPONSE);
+        break;
+    }
+
+    case IOCTL_WFP_UPLOAD_CLEAR_APP_LIST:
+    {
+        ClearMonitoredAppList();
+        break;
+    }
+
+    case IOCTL_WFP_UPLOAD_ADD_APP_PRESET:
+    {
+        PAPP_PRESET_REQUEST pReq = (PAPP_PRESET_REQUEST)inputBuffer;
+        PAPP_PRESET_RESPONSE pResp = (PAPP_PRESET_RESPONSE)outputBuffer;
+
+        if (pReq == NULL || inputLength < sizeof(APP_PRESET_REQUEST)) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        ULONG addedCount = AddAppPreset(pReq->PresetType);
+
+        if (pResp != NULL && outputLength >= sizeof(APP_PRESET_RESPONSE)) {
+            RtlZeroMemory(pResp, sizeof(APP_PRESET_RESPONSE));
+            pResp->Success = (addedCount > 0) ? 1 : 0;
+            pResp->AddedCount = addedCount;
+            pResp->TotalApps = g_MonitoredAppList ? (ULONG)g_MonitoredAppList->Count : 0;
+            information = sizeof(APP_PRESET_RESPONSE);
+        }
+        break;
+    }
+
     default:
         status = STATUS_INVALID_DEVICE_REQUEST;
         break;
@@ -3023,6 +4364,7 @@ void DriverUnload(_In_ PDRIVER_OBJECT DriverObject)
     CleanupPacketQueue();
     CleanupSniBlockList();
     CleanupIpCache();
+    CleanupUploadDlp();
 
     if (g_DriverContext != NULL) {
         ExFreePoolWithTag(g_DriverContext, 'TCFW');
@@ -3130,13 +4472,19 @@ NTSTATUS DriverEntry(
         goto Cleanup;
     }
 
+    status = InitializeUploadDlp();
+    if (!NT_SUCCESS(status)) {
+        KdPrint(("WFP: InitializeUploadDlp failed: 0x%08X\n", status));
+        goto Cleanup;
+    }
+
     status = RegisterWfpFilter(deviceObject);
     if (!NT_SUCCESS(status)) {
         KdPrint(("WFP: RegisterWfpFilter failed: 0x%08X\n", status));
         goto Cleanup;
     }
 
-    KdPrint(("WFP: Driver loaded successfully (SNI + QUIC + DNS blocking)\n"));
+    KdPrint(("WFP: Driver loaded successfully (SNI + QUIC + DNS blocking + Upload blocking)\n"));
     return STATUS_SUCCESS;
 
 Cleanup:
@@ -3144,6 +4492,7 @@ Cleanup:
         CleanupPacketQueue();
         CleanupSniBlockList();
         CleanupIpCache();
+        CleanupUploadDlp();
         ExFreePoolWithTag(g_DriverContext, 'TCFW');
         g_DriverContext = NULL;
     }
